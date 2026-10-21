@@ -87,7 +87,7 @@ import (
 
 const (
 	pluginName    = "agentrouter"
-	pluginVersion = "0.2.0"
+	pluginVersion = "0.2.1"
 	pluginAuthor  = "smartwu2003"
 	pluginRepo    = "https://github.com/smartwu2003/agentrouter-cliproxyapi-plugin"
 	providerKey   = "agentrouter"

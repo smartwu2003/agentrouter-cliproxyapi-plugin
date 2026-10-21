@@ -11,6 +11,8 @@ import (
 // call the plugin's authenticated management routes.
 func renderDashboard(cfg pluginConfig) string {
 	replacer := strings.NewReplacer(
+		"{{STYLE}}", dashboardCSS,
+		"{{SCRIPT}}", dashboardJS,
 		"{{BASE_URL}}", html.EscapeString(cfg.BaseURL),
 		"{{PLUGIN_VERSION}}", html.EscapeString(pluginVersion),
 		"{{DATA_DIR}}", html.EscapeString(statePath(cfg)),

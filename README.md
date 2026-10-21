@@ -80,6 +80,13 @@ plugins:
 3. 重启内核（EasyCLIProxyAPI 里重启服务），确认 `GET /v0/management/plugins` 中 `registered` 与 `effective_enabled` 均为 `true`。
 4. 管理页地址：`http://<host>:<port>/v0/resource/plugins/agentrouter/status`，EasyCLIProxyAPI 会自动在侧边栏生成入口。
 
+## 界面与响应速度
+
+- 控制台采用 1160px 居中布局、分段式页签、卡片标题分隔、语义化状态胶囊、骨架屏与 160ms 过渡（跟随系统深/浅色）。
+- 页面数据按 90 秒 TTL 缓存（内存 + sessionStorage），切页先渲染缓存再后台刷新；手动刷新按钮发送 `?refresh=1` 跳过缓存。
+- 后端对看板/日志/账号/公告/令牌接口做并行拉取 + TTL 缓存（15s/15s/20s/120s/30s）并合并并发相同请求；实测看板接口二次请求从 ~0.9s 降到 ~55ms。
+- 登录、保存令牌/配置、签到后会清空相关缓存；页面隐藏时暂停看板轮询，返回时自动刷新一次。
+
 ## 账号授权（插件卡片按钮）
 
 在 EasyCLIProxyAPI 的「插件」页，AgentRouter 卡片上会出现「账号授权」按钮。点击后内核会：

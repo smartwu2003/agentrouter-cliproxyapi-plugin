@@ -97,6 +97,7 @@ func (c accountClient) do(ctx context.Context, method, path string, query url.Va
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
+	started := time.Now()
 	request, errRequest := http.NewRequestWithContext(reqCtx, method, c.endpoint(path, query), reader)
 	if errRequest != nil {
 		return nil, errRequest
@@ -121,20 +122,26 @@ func (c accountClient) do(ctx context.Context, method, path string, query url.Va
 	}
 	raw, errRead := io.ReadAll(io.LimitReader(response.Body, 8<<20))
 	response.Body.Close()
+	elapsed := time.Since(started)
 	if errRead != nil {
 		return nil, errRead
 	}
 	if isWAFChallenge(raw) {
 		// The console answered with an Aliyun WAF interstitial. It is triggered
-		// by request bursts and clears after a short cooldown; retry on a fresh
-		// connection and, if that still fails, on the alternate origin.
-		for _, attempt := range []struct {
+		// by request bursts and clears after a short cooldown. One short retry
+		// is usually enough; hammering it only deepens the block. The dashboard
+		// aggregation is skipped entirely when the first attempt was already
+		// slow, because a retry would double an already painful page load.
+		retries := []struct {
 			delay time.Duration
 			host  string
 		}{
-			{delay: 1200 * time.Millisecond, host: ""},
-			{delay: 800 * time.Millisecond, host: alternateAccountHost(c.cfg)},
-		} {
+			{delay: 400 * time.Millisecond, host: ""},
+		}
+		if path == "/api/data/self" && elapsed > slowFirstAttempt {
+			retries = nil
+		}
+		for _, attempt := range retries {
 			if attempt.delay > 0 {
 				select {
 				case <-reqCtx.Done():
@@ -195,6 +202,10 @@ func (c accountClient) do(ctx context.Context, method, path string, query url.Va
 	}
 	return payload, nil
 }
+
+// slowFirstAttempt is the latency after which a WAF-blocked dashboard
+// aggregation is not retried: the retry would double an already slow load.
+const slowFirstAttempt = 3 * time.Second
 
 // alternateAccountHost returns the other console origin to try after a WAF block.
 func alternateAccountHost(cfg pluginConfig) string {

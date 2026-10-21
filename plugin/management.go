@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -101,7 +103,7 @@ func handleManagement(raw []byte) ([]byte, error) {
 	case routeAPIKeys:
 		return okEnvelope(apiKeysResponse(req))
 	case routeAnnouncements:
-		return okEnvelope(announcementsResponse())
+		return okEnvelope(announcementsResponse(req))
 	default:
 		return okEnvelope(jsonResponse(http.StatusNotFound, map[string]any{"success": false, "message": "route not found"}))
 	}
@@ -261,6 +263,7 @@ func saveSettingsResponse(req pluginapi.ManagementRequest) pluginapi.ManagementR
 	activeConfig = merged
 	activeConfigMu.Unlock()
 	primeCatalogue(merged)
+	invalidateManagementCache()
 	return jsonResponse(http.StatusOK, map[string]any{
 		"success":      true,
 		"message":      "配置已保存",
@@ -296,16 +299,116 @@ func refreshModelsResponse(req pluginapi.ManagementRequest) pluginapi.Management
 
 func accountResponse(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	cfg := mergeOverrides(effectiveConfig(), req.Body)
-	info, errInfo := fetchAccountInfo(context.Background(), cfg)
-	if errInfo != nil {
-		return jsonResponse(http.StatusBadGateway, map[string]any{"success": false, "message": errInfo.Error()})
+	client := newAccountClient(cfg)
+	key := managementCacheKey("account", cfg, client, req.Query)
+	return managementStore.serve(key, cacheTTLAccount, refreshRequested(req), func() (map[string]any, int, bool) {
+		info, errInfo := fetchAccountInfoParallel(context.Background(), cfg)
+		if errInfo != nil {
+			// Configuration / credential problems are deterministic but must stay
+			// visible to the UI, so they are returned, never cached.
+			return map[string]any{"success": false, "message": errInfo.Error()}, http.StatusBadGateway, false
+		}
+		return map[string]any{"success": true, "account": info}, http.StatusOK, info.Success
+	})
+}
+
+// fetchAccountInfoParallel mirrors fetchAccountInfo (which lives in account.go)
+// but fans out the independent upstream reads. The model list, profile and
+// group data do not depend on each other, so the card renders after the
+// slowest call instead of the sum of all three. The response shape is
+// identical to fetchAccountInfo.
+func fetchAccountInfoParallel(ctx context.Context, cfg pluginConfig) (accountInfo, error) {
+	client := newAccountClient(cfg)
+	info := accountInfo{}
+	if !client.hasCredentials() && hasAccountCredentials(cfg) {
+		// No durable token yet: sign in once to obtain one. This must finish
+		// before the dashboard calls can carry credentials.
+		flow, errAuth := authorizeAccount(ctx, cfg)
+		if errAuth != nil {
+			info.Message = errAuth.Error()
+			return info, nil
+		}
+		applyFlowToState(cfg, flow)
+		invalidateManagementCache()
+		client = newAccountClient(effectiveConfig())
 	}
-	return jsonResponse(http.StatusOK, map[string]any{"success": true, "account": info})
+	if state := cachedState(); state.Account != nil {
+		info.CheckedIn = state.Account.CheckedIn
+		info.CheckedInAt = state.Account.CheckedInAt
+		info.LastCheckin = state.LastCheckin
+	}
+	if !client.hasCredentials() {
+		// The model list only needs the inference API key, so it still renders
+		// when the dashboard account itself is not authorized.
+		if models, errModels := fetchAPIKeyModels(ctx, cfg); errModels == nil {
+			for _, model := range models {
+				info.Models = append(info.Models, model.ID)
+			}
+		}
+		info.Message = "账号尚未授权：点击「账号授权」登录 AgentRouter，或在配置中填写 account_token 与 user_id"
+		return info, nil
+	}
+	info.Authorized = true
+
+	var (
+		wg        sync.WaitGroup
+		models    []pluginapi.ModelInfo
+		errModels error
+		user      selfUser
+		errSelf   error
+		groups    map[string]any
+		errGroups error
+	)
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		models, errModels = fetchAPIKeyModels(ctx, cfg)
+	}()
+	go func() {
+		defer wg.Done()
+		user, errSelf = client.fetchSelf(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		groups, errGroups = client.fetchGroups(ctx)
+	}()
+	wg.Wait()
+
+	if errModels == nil {
+		for _, model := range models {
+			info.Models = append(info.Models, model.ID)
+		}
+	}
+	if errSelf != nil {
+		info.Message = errSelf.Error()
+		return info, nil
+	}
+	info.Success = true
+	info.Username = user.Username
+	info.DisplayName = user.DisplayName
+	info.Email = user.Email
+	info.Group = user.Group
+	info.UserID = fmt.Sprint(user.ID)
+	info.QuotaUSD = quotaToUSD(user.Quota)
+	info.UsedUSD = quotaToUSD(user.UsedQuota)
+	info.RequestCount = user.RequestCount
+	if client.token == "" {
+		info.Message = "当前只有浏览器会话凭据，部分接口（令牌管理、签到）可能不可用；建议重新执行账号授权以获取访问令牌"
+	}
+	if errGroups == nil {
+		info.Groups = groups
+	}
+	info.APIKeyMasked = maskSecret(cfg.APIKey)
+	return info, nil
 }
 
 func checkinResponse(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	cfg := mergeOverrides(effectiveConfig(), req.Body)
+	// A check-in can change the balance and session, so drop cached reads
+	// before and after the attempt.
+	invalidateManagementCache()
 	result, errCheckin := performCheckin(context.Background(), cfg)
+	invalidateManagementCache()
 	if errCheckin != nil {
 		return jsonResponse(http.StatusBadGateway, map[string]any{
 			"success": false,
@@ -417,6 +520,7 @@ func loginResponse(req pluginapi.ManagementRequest) pluginapi.ManagementResponse
 	activeConfig = merged
 	activeConfigMu.Unlock()
 	primeCatalogue(merged)
+	invalidateManagementCache()
 	return jsonResponse(http.StatusOK, map[string]any{
 		"success":      true,
 		"message":      flow.Message,
@@ -449,6 +553,7 @@ func loginTokenResponse(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 		activeConfig = merged
 		activeConfigMu.Unlock()
 		primeCatalogue(merged)
+		invalidateManagementCache()
 		return jsonResponse(http.StatusOK, map[string]any{"success": true, "message": "浏览器会话已保存", "user_id": saved.UserID})
 	}
 	state, errSave := saveManualToken(cfg, payload.Token, payload.UserID, payload.Username)
@@ -460,6 +565,7 @@ func loginTokenResponse(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 	activeConfig = merged
 	activeConfigMu.Unlock()
 	primeCatalogue(merged)
+	invalidateManagementCache()
 	return jsonResponse(http.StatusOK, map[string]any{
 		"success": true,
 		"message": "访问令牌已保存",
@@ -486,9 +592,17 @@ func logsResponse(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 	cfg := effectiveConfig()
 	client := newAccountClient(cfg)
 	if !client.hasCredentials() {
-		return jsonResponse(http.StatusOK, map[string]any{"success": false, "authorized": false, "message": "账号尚未授权"})
+		return jsonResponse(http.StatusOK, map[string]any{"success": false, "authorized": false, "cached": false, "message": "账号尚未授权"})
 	}
-	query := req.Query
+	key := managementCacheKey("logs", cfg, client, logsCacheQuery(req.Query))
+	return managementStore.serve(key, cacheTTLLogs, refreshRequested(req), func() (map[string]any, int, bool) {
+		payload, status, cacheable := fetchLogsPayload(req.Query, client)
+		return payload, status, cacheable
+	})
+}
+
+// fetchLogsPayload performs the upstream usage-log read for logsResponse.
+func fetchLogsPayload(query url.Values, client accountClient) (map[string]any, int, bool) {
 	logType := -1
 	if value := strings.TrimSpace(query.Get("type")); value != "" {
 		if parsed, errAtoi := strconv.Atoi(value); errAtoi == nil {
@@ -523,7 +637,7 @@ func logsResponse(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 	defer cancel()
 	pageData, errLogs := client.fetchLogs(ctx, logType, page, pageSize, model, start, end)
 	if errLogs != nil {
-		return jsonResponse(http.StatusBadGateway, map[string]any{"success": false, "message": errLogs.Error()})
+		return map[string]any{"success": false, "message": errLogs.Error()}, http.StatusBadGateway, false
 	}
 	items := make([]map[string]any, 0, len(pageData.Items))
 	for _, item := range pageData.Items {
@@ -544,21 +658,26 @@ func logsResponse(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 			"group":             item.Group,
 		})
 	}
-	return jsonResponse(http.StatusOK, map[string]any{
+	return map[string]any{
 		"success":   true,
 		"page":      pageData.Page,
 		"page_size": pageData.PageSize,
 		"total":     pageData.Total,
 		"items":     items,
-	})
+	}, http.StatusOK, true
 }
 
 // dashboardResponse returns the usage aggregation used for charts.
+//
+// The three upstream reads (aggregation, stat summary, account profile) are
+// independent and are fetched concurrently: the page waits for the slowest
+// call instead of the sum of all three. A successful upstream aggregation is
+// cached briefly (see cacheTTLDashboard) unless ?refresh=1 is sent.
 func dashboardResponse(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	cfg := effectiveConfig()
 	client := newAccountClient(cfg)
 	if !client.hasCredentials() {
-		return jsonResponse(http.StatusOK, map[string]any{"success": false, "authorized": false, "message": "账号尚未授权"})
+		return jsonResponse(http.StatusOK, map[string]any{"success": false, "authorized": false, "cached": false, "message": "账号尚未授权"})
 	}
 	days := 7
 	if value := strings.TrimSpace(req.Query.Get("days")); value != "" {
@@ -566,23 +685,59 @@ func dashboardResponse(req pluginapi.ManagementRequest) pluginapi.ManagementResp
 			days = parsed
 		}
 	}
-	defaultTime := strings.TrimSpace(req.Query.Get("interval"))
-	if defaultTime == "" {
+	interval := strings.TrimSpace(req.Query.Get("interval"))
+	if interval == "" {
 		if days <= 2 {
-			defaultTime = "hour"
+			interval = "hour"
 		} else {
-			defaultTime = "day"
+			interval = "day"
 		}
 	}
-	end := time.Now().Unix()
+	// Bucket the window so repeat loads inside one cache TTL share a key.
+	end := time.Now().Unix() / 30 * 30
 	start := end - int64(days)*86400
+	key := managementCacheKey("dashboard", cfg, client, url.Values{
+		"days":     {strconv.Itoa(days)},
+		"interval": {interval},
+	})
+	return managementStore.serve(key, cacheTTLDashboard, refreshRequested(req), func() (map[string]any, int, bool) {
+		return fetchDashboardPayload(client, days, interval, start, end)
+	})
+}
+
+// fetchDashboardPayload fans out the dashboard reads and assembles the payload.
+func fetchDashboardPayload(client accountClient, days int, interval string, start, end int64) (map[string]any, int, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	points, errData := client.fetchDashboard(ctx, start, end, defaultTime)
+
+	var (
+		wg        sync.WaitGroup
+		points    []dashboardPoint
+		errData   error
+		stat      map[string]float64
+		user      selfUser
+		errUser   error
+		profileOK bool
+	)
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		points, errData = client.fetchDashboard(ctx, start, end, interval)
+	}()
+	go func() {
+		defer wg.Done()
+		stat, _ = client.fetchLogStat(ctx, start, end, "")
+	}()
+	go func() {
+		defer wg.Done()
+		user, errUser = client.fetchSelf(ctx)
+		profileOK = errUser == nil
+	}()
+	wg.Wait()
+
 	if errData != nil {
-		return jsonResponse(http.StatusBadGateway, map[string]any{"success": false, "message": errData.Error()})
+		return map[string]any{"success": false, "message": errData.Error()}, http.StatusBadGateway, false
 	}
-	stat, _ := client.fetchLogStat(ctx, start, end, "")
 	byModel := map[string]map[string]any{}
 	timeline := map[string]map[string]any{}
 	var totalQuota, totalTokens, totalCount int64
@@ -595,11 +750,11 @@ func dashboardResponse(req pluginapi.ManagementRequest) pluginapi.ManagementResp
 		bucket["quota_usd"] = bucket["quota_usd"].(float64) + quotaToUSD(float64(point.Quota))
 		bucket["tokens"] = bucket["tokens"].(int64) + point.TokenUsed
 		bucket["count"] = bucket["count"].(int64) + point.Count
-		key := time.Unix(point.CreatedAt, 0).In(beijingLocation()).Format("01-02 15:04")
-		slot := timeline[key]
+		slotKey := time.Unix(point.CreatedAt, 0).In(beijingLocation()).Format("01-02 15:04")
+		slot := timeline[slotKey]
 		if slot == nil {
-			slot = map[string]any{"time": key, "quota_usd": 0.0, "tokens": int64(0), "count": int64(0)}
-			timeline[key] = slot
+			slot = map[string]any{"time": slotKey, "quota_usd": 0.0, "tokens": int64(0), "count": int64(0)}
+			timeline[slotKey] = slot
 		}
 		slot["quota_usd"] = slot["quota_usd"].(float64) + quotaToUSD(float64(point.Quota))
 		slot["tokens"] = slot["tokens"].(int64) + point.TokenUsed
@@ -624,7 +779,7 @@ func dashboardResponse(req pluginapi.ManagementRequest) pluginapi.ManagementResp
 	payload := map[string]any{
 		"success":      true,
 		"days":         days,
-		"interval":     defaultTime,
+		"interval":     interval,
 		"points":       points,
 		"by_model":     modelList,
 		"timeline":     timelineList,
@@ -633,59 +788,66 @@ func dashboardResponse(req pluginapi.ManagementRequest) pluginapi.ManagementResp
 		"total_count":  totalCount,
 		"stat":         stat,
 	}
-	if user, errSelf := client.fetchSelf(ctx); errSelf == nil {
+	if profileOK {
 		payload["quota_usd"] = quotaToUSD(user.Quota)
 		payload["used_usd"] = quotaToUSD(user.UsedQuota)
 		payload["request_count"] = user.RequestCount
 		payload["group"] = user.Group
 		payload["username"] = user.Username
 	}
-	return jsonResponse(http.StatusOK, payload)
+	return payload, http.StatusOK, true
 }
 
 func apiKeysResponse(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	cfg := effectiveConfig()
 	client := newAccountClient(cfg)
 	if !client.hasCredentials() {
-		return jsonResponse(http.StatusOK, map[string]any{"success": false, "authorized": false, "message": "账号尚未授权"})
+		return jsonResponse(http.StatusOK, map[string]any{"success": false, "authorized": false, "cached": false, "message": "账号尚未授权"})
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-	defer cancel()
-	tokens, errList := client.listTokens(ctx, 100)
-	if errList != nil {
-		return jsonResponse(http.StatusBadGateway, map[string]any{"success": false, "message": errList.Error()})
-	}
-	items := make([]map[string]any, 0, len(tokens))
-	for _, token := range tokens {
-		items = append(items, map[string]any{
-			"id":              token.ID,
-			"name":            token.Name,
-			"key_masked":      maskSecret(token.Key),
-			"status":          token.Status,
-			"created_time":    token.CreatedTime,
-			"accessed_time":   token.AccessedTime,
-			"expired_time":    token.ExpiredTime,
-			"unlimited_quota": token.UnlimitedQuota,
-			"used_usd":        quotaToUSD(float64(token.UsedQuota)),
-			"in_use":          strings.TrimSpace(token.Key) != "" && token.Key == cfg.APIKey,
-		})
-	}
-	return jsonResponse(http.StatusOK, map[string]any{
-		"success":      true,
-		"items":        items,
-		"api_key_name": cfg.APIKeyName,
+	key := managementCacheKey("tokens", cfg, client, req.Query)
+	return managementStore.serve(key, cacheTTLTokens, refreshRequested(req), func() (map[string]any, int, bool) {
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		tokens, errList := client.listTokens(ctx, 100)
+		if errList != nil {
+			return map[string]any{"success": false, "message": errList.Error()}, http.StatusBadGateway, false
+		}
+		items := make([]map[string]any, 0, len(tokens))
+		for _, token := range tokens {
+			items = append(items, map[string]any{
+				"id":              token.ID,
+				"name":            token.Name,
+				"key_masked":      maskSecret(token.Key),
+				"status":          token.Status,
+				"created_time":    token.CreatedTime,
+				"accessed_time":   token.AccessedTime,
+				"expired_time":    token.ExpiredTime,
+				"unlimited_quota": token.UnlimitedQuota,
+				"used_usd":        quotaToUSD(float64(token.UsedQuota)),
+				"in_use":          strings.TrimSpace(token.Key) != "" && token.Key == cfg.APIKey,
+			})
+		}
+		return map[string]any{
+			"success":      true,
+			"items":        items,
+			"api_key_name": cfg.APIKeyName,
+		}, http.StatusOK, true
 	})
 }
 
-func announcementsResponse() pluginapi.ManagementResponse {
+func announcementsResponse(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	cfg := effectiveConfig()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	items, errFetch := fetchAnnouncements(ctx, cfg)
-	if errFetch != nil {
-		return jsonResponse(http.StatusOK, map[string]any{"success": false, "message": errFetch.Error()})
-	}
-	return jsonResponse(http.StatusOK, map[string]any{"success": true, "announcements": items})
+	client := newAccountClient(cfg)
+	key := managementCacheKey("announcements", cfg, client, req.Query)
+	return managementStore.serve(key, cacheTTLAnnouncements, refreshRequested(req), func() (map[string]any, int, bool) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		items, errFetch := fetchAnnouncements(ctx, cfg)
+		if errFetch != nil {
+			return map[string]any{"success": false, "message": errFetch.Error()}, http.StatusOK, false
+		}
+		return map[string]any{"success": true, "announcements": items}, http.StatusOK, true
+	})
 }
 
 func formatTime(value time.Time) string {
