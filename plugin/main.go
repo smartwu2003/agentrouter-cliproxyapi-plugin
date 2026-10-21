@@ -7,9 +7,11 @@
 //   - model_registrar: publishes the models configured for AgentRouter.
 //   - executor: speaks the AgentRouter upstream protocols (OpenAI Chat
 //     Completions, OpenAI Responses and Anthropic Messages).
-//   - management_api: exposes a browser resource page and authenticated
-//     management routes used to refresh the model catalogue, inspect the
-//     account and perform the daily check-in.
+//   - auth_provider: the plugin card's 账号授权 button opens a local sign-in
+//     page that captures the AgentRouter session/access token.
+//   - management_api: exposes a browser console page with the account
+//     overview, usage dashboard, model catalogue, usage log, check-in and
+//     editable settings.
 //
 // AgentRouter gates its gateway on the client User-Agent, so every upstream
 // request is sent with a configurable, client-like User-Agent.
@@ -85,7 +87,7 @@ import (
 
 const (
 	pluginName    = "agentrouter"
-	pluginVersion = "0.1.0"
+	pluginVersion = "0.2.0"
 	pluginAuthor  = "smartwu2003"
 	pluginRepo    = "https://github.com/smartwu2003/agentrouter-cliproxyapi-plugin"
 	providerKey   = "agentrouter"
@@ -119,6 +121,7 @@ type registrationCapability struct {
 	ModelRegistrar bool     `json:"model_registrar"`
 	ModelRouter    bool     `json:"model_router"`
 	Executor       bool     `json:"executor"`
+	AuthProvider   bool     `json:"auth_provider"`
 	ManagementAPI  bool     `json:"management_api"`
 	ExecutorScope  string   `json:"executor_model_scope"`
 	InputFormats   []string `json:"executor_input_formats,omitempty"`
@@ -205,8 +208,16 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return modelRegister()
 	case pluginabi.MethodModelRoute:
 		return routeModelRequest(request)
-	case pluginabi.MethodExecutorIdentifier:
+	case pluginabi.MethodExecutorIdentifier, pluginabi.MethodAuthIdentifier:
 		return okEnvelope(identifierResponse{Identifier: providerKey})
+	case pluginabi.MethodAuthParse:
+		return parseAuth(request)
+	case pluginabi.MethodAuthLoginStart:
+		return startLogin(request)
+	case pluginabi.MethodAuthLoginPoll:
+		return pollLogin(request)
+	case pluginabi.MethodAuthRefresh:
+		return refreshAuth(request)
 	case pluginabi.MethodExecutorExecute:
 		return executeRequest(request)
 	case pluginabi.MethodExecutorExecuteStream:
@@ -242,6 +253,11 @@ func buildRegistration() registration {
 				{Name: "model_protocols", Type: pluginapi.ConfigFieldTypeObject, Description: "Map of model name to protocol override (openai, responses or anthropic)."},
 				{Name: "username", Type: pluginapi.ConfigFieldTypeString, Description: "AgentRouter account username or email, used for the daily check-in."},
 				{Name: "password", Type: pluginapi.ConfigFieldTypeString, Description: "AgentRouter account password, used for the daily check-in."},
+				{Name: "account_token", Type: pluginapi.ConfigFieldTypeString, Description: "Optional New API system access token (个人设置 → 系统令牌). The dashboard stores it automatically after an account authorization."},
+				{Name: "user_id", Type: pluginapi.ConfigFieldTypeString, Description: "Optional numeric AgentRouter user ID sent as New-Api-User for dashboard calls."},
+				{Name: "api_key_name", Type: pluginapi.ConfigFieldTypeString, Default: "EasyCLIProxyAPI", Description: "Token name the plugin creates or reuses when provisioning an inference API key."},
+				{Name: "data_dir", Type: pluginapi.ConfigFieldTypeString, Description: "Directory for persisted dashboard state (default: plugins/ next to the core binary)."},
+				{Name: "dashboard_base_url", Type: pluginapi.ConfigFieldTypeString, Default: defaultDashboardURL, Description: "Console origin used for account/dashboard APIs (default https://ps.air-outer.com; the plugin retries https://agentrouter.org when the WAF blocks it)."},
 				{Name: "checkin_on_startup", Type: pluginapi.ConfigFieldTypeBoolean, Default: false, Description: "Run the daily check-in once when the plugin loads."},
 				{Name: "checkin_hour", Type: pluginapi.ConfigFieldTypeInteger, Default: 9, Description: "Beijing-time hour (0-23) after which the automatic check-in may run."},
 			},
@@ -250,6 +266,7 @@ func buildRegistration() registration {
 			ModelRegistrar: true,
 			ModelRouter:    true,
 			Executor:       true,
+			AuthProvider:   true,
 			ManagementAPI:  true,
 			ExecutorScope:  string(pluginapi.ExecutorModelScopeStatic),
 			InputFormats:   []string{"chat-completions", "responses", "anthropic"},
@@ -273,6 +290,10 @@ func configure(raw []byte) error {
 		}
 		cfg = decoded
 	}
+	// Dashboard-created credentials live in the plugin state file; merge them
+	// so a reconfigure does not silently drop an account authorization.
+	state := loadState(cfg)
+	cfg = applyState(cfg, state)
 	activeConfigMu.Lock()
 	activeConfig = cfg
 	activeConfigMu.Unlock()

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"net/url"
@@ -24,12 +25,21 @@ func controlPlaneClient(cfg pluginConfig) *http.Client {
 	if client, ok := controlPlaneClients.byKey[key]; ok {
 		return client
 	}
+	dialer := &net.Dialer{
+		Timeout:   20 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
 	transport := &http.Transport{
 		Proxy: nil,
-		DialContext: (&net.Dialer{
-			Timeout:   20 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		// Prefer IPv4: the console origin publishes an AAAA record that some
+		// mainland networks cannot reach, and Go would otherwise stall on it.
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, errDial := dialer.DialContext(ctx, "tcp4", addr)
+			if errDial == nil {
+				return conn, nil
+			}
+			return dialer.DialContext(ctx, network, addr)
+		},
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          16,
 		IdleConnTimeout:       90 * time.Second,

@@ -58,12 +58,22 @@ func hasAccountCredentials(cfg pluginConfig) bool {
 	return strings.TrimSpace(cfg.Username) != "" && strings.TrimSpace(cfg.Password) != ""
 }
 
+// loginResult is the account payload returned by the New API login endpoint.
+type loginResult struct {
+	Session dashboardSession
+	Token   string
+	UserID  string
+	Checked bool
+	Self    selfUser
+	Raw     map[string]any
+}
+
 // loginDashboard authenticates against the New API dashboard. AgentRouter
 // redeems the daily check-in reward during login, so a successful login is
 // also a successful check-in; the response reports `checked_in`.
-func loginDashboard(ctx context.Context, cfg pluginConfig) (dashboardSession, error) {
+func loginDashboard(ctx context.Context, cfg pluginConfig) (loginResult, error) {
 	if !hasAccountCredentials(cfg) {
-		return dashboardSession{}, fmt.Errorf("account credentials are not configured (username/password)")
+		return loginResult{}, errAccountNotAuthorized
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -71,25 +81,25 @@ func loginDashboard(ctx context.Context, cfg pluginConfig) (dashboardSession, er
 		"username": cfg.Username,
 		"password": cfg.Password,
 	})
-	endpoint := strings.TrimSuffix(cfg.BaseURL, "/") + "/api/user/login"
+	endpoint := controlEndpoint(cfg, "/api/user/login")
 	request, errRequest := http.NewRequestWithContext(requestCtx, http.MethodPost, endpoint, strings.NewReader(string(payload)))
 	if errRequest != nil {
-		return dashboardSession{}, errRequest
+		return loginResult{}, errRequest
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("User-Agent", cfg.UserAgent)
 	response, errDo := controlPlaneClient(cfg).Do(request)
 	if errDo != nil {
-		return dashboardSession{}, fmt.Errorf("login: %w", errDo)
+		return loginResult{}, fmt.Errorf("login: %w", errDo)
 	}
 	defer response.Body.Close()
 	body, errRead := io.ReadAll(io.LimitReader(response.Body, 4<<20))
 	if errRead != nil {
-		return dashboardSession{}, fmt.Errorf("read login response: %w", errRead)
+		return loginResult{}, fmt.Errorf("read login response: %w", errRead)
 	}
 	if response.StatusCode != http.StatusOK {
-		return dashboardSession{}, newUpstreamError(response.StatusCode, summarizeUpstreamError(body))
+		return loginResult{}, newUpstreamError(response.StatusCode, summarizeUpstreamError(body))
 	}
 	var login struct {
 		Success bool           `json:"success"`
@@ -97,15 +107,16 @@ func loginDashboard(ctx context.Context, cfg pluginConfig) (dashboardSession, er
 		Data    map[string]any `json:"data"`
 	}
 	if errUnmarshal := json.Unmarshal(body, &login); errUnmarshal != nil {
-		return dashboardSession{}, fmt.Errorf("decode login response: %w", errUnmarshal)
+		return loginResult{}, fmt.Errorf("decode login response: %w", errUnmarshal)
 	}
 	if !login.Success {
 		message := strings.TrimSpace(login.Message)
 		if message == "" {
 			message = "login failed"
 		}
-		return dashboardSession{}, fmt.Errorf("%s", message)
+		return loginResult{}, fmt.Errorf("%s", message)
 	}
+	result := loginResult{Raw: login.Data}
 	session := dashboardSession{username: cfg.Username, loginAt: time.Now()}
 	if cookies := response.Header.Values("Set-Cookie"); len(cookies) > 0 {
 		parts := make([]string, 0, len(cookies))
@@ -116,18 +127,67 @@ func loginDashboard(ctx context.Context, cfg pluginConfig) (dashboardSession, er
 		}
 		session.cookie = strings.Join(parts, "; ")
 	}
-	if session.cookie == "" {
-		return dashboardSession{}, fmt.Errorf("login succeeded but no session cookie was returned")
-	}
 	if id, okID := login.Data["id"]; okID {
 		session.userID = fmt.Sprint(id)
+		result.UserID = session.userID
 	}
 	if checkedIn, okChecked := login.Data["checked_in"]; okChecked {
 		if flag, okBool := checkedIn.(bool); okBool && flag {
 			session.checkedIn = true
+			result.Checked = true
 		}
 	}
-	return session, nil
+	result.Session = session
+	// The login payload is a user profile; reuse it instead of an extra call.
+	if raw, errMarshal := json.Marshal(login.Data); errMarshal == nil {
+		var user selfUser
+		if json.Unmarshal(raw, &user) == nil {
+			result.Self = user
+		}
+	}
+	return result, nil
+}
+
+// fetchLoginToken reads the durable New API access token with the browser
+// session captured by loginDashboard.
+func fetchLoginToken(ctx context.Context, cfg pluginConfig, session dashboardSession) (string, error) {
+	if session.cookie == "" {
+		return "", fmt.Errorf("login returned no session cookie")
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	request, errRequest := http.NewRequestWithContext(requestCtx, http.MethodGet, strings.TrimSuffix(cfg.BaseURL, "/")+"/api/user/token", nil)
+	if errRequest != nil {
+		return "", errRequest
+	}
+	request.Header.Set("Cookie", session.cookie)
+	request.Header.Set("New-Api-User", session.userID)
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", cfg.UserAgent)
+	response, errDo := controlPlaneClient(cfg).Do(request)
+	if errDo != nil {
+		return "", errDo
+	}
+	defer response.Body.Close()
+	body, errRead := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if errRead != nil {
+		return "", errRead
+	}
+	if response.StatusCode != http.StatusOK {
+		return "", newUpstreamError(response.StatusCode, summarizeUpstreamError(body))
+	}
+	var payload struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+		Data    string `json:"data"`
+	}
+	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
+		return "", errUnmarshal
+	}
+	if !payload.Success || strings.TrimSpace(payload.Data) == "" {
+		return "", fmt.Errorf("account token unavailable: %s", strings.TrimSpace(payload.Message))
+	}
+	return strings.TrimSpace(payload.Data), nil
 }
 
 func cookiePair(setCookie string) (string, bool) {
@@ -143,12 +203,12 @@ func ensureSession(ctx context.Context, cfg pluginConfig) (dashboardSession, err
 	if session, ok := cachedSession(cfg); ok {
 		return session, nil
 	}
-	session, errLogin := loginDashboard(ctx, cfg)
+	result, errLogin := loginDashboard(ctx, cfg)
 	if errLogin != nil {
 		return dashboardSession{}, errLogin
 	}
-	storeSession(cfg, session)
-	return session, nil
+	storeSession(cfg, result.Session)
+	return result.Session, nil
 }
 
 // logoutDashboard invalidates the cached dashboard session (best effort).
@@ -159,7 +219,7 @@ func logoutDashboard(ctx context.Context, cfg pluginConfig) {
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	endpoint := strings.TrimSuffix(cfg.BaseURL, "/") + "/api/user/logout"
+	endpoint := controlEndpoint(cfg, "/api/user/logout")
 	request, errRequest := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
 	if errRequest == nil {
 		request.Header.Set("Cookie", session.cookie)
@@ -175,6 +235,80 @@ func logoutDashboard(ctx context.Context, cfg pluginConfig) {
 	dropSession(cfg)
 }
 
+// flowResult is the outcome of one authorization / sign-in flow.
+type flowResult struct {
+	Success     bool
+	Message     string
+	Token       string
+	UserID      string
+	Username    string
+	DisplayName string
+	Email       string
+	Group       string
+	Quota       float64
+	Used        float64
+	Requests    int64
+	CheckedIn   bool
+	APIKey      string
+	APIKeyID    int64
+	APIKeyName  string
+	Session     string
+}
+
+// authorizeAccount signs into AgentRouter, captures the durable dashboard
+// token, and provisions an API key for inference when none is configured.
+func authorizeAccount(ctx context.Context, cfg pluginConfig) (flowResult, error) {
+	result, errLogin := loginDashboard(ctx, cfg)
+	if errLogin != nil {
+		return flowResult{Message: errLogin.Error()}, errLogin
+	}
+	flow := flowResult{
+		Token:       result.Token,
+		UserID:      result.UserID,
+		Username:    result.Self.Username,
+		DisplayName: result.Self.DisplayName,
+		Email:       result.Self.Email,
+		Group:       result.Self.Group,
+		Quota:       quotaToUSD(result.Self.Quota),
+		Used:        quotaToUSD(result.Self.UsedQuota),
+		Requests:    result.Self.RequestCount,
+		CheckedIn:   result.Checked,
+		Session:     result.Session.cookie,
+	}
+	if token, errToken := fetchLoginToken(ctx, cfg, result.Session); errToken == nil {
+		flow.Token = token
+	} else {
+		hostLog("warn", "agentrouter dashboard token unavailable; keeping session", map[string]any{"error": errToken.Error()})
+	}
+	client := accountClient{cfg: cfg, token: flow.Token, userID: result.UserID, session: result.Session.cookie}
+	if tokens, errList := client.listTokens(ctx, 100); errList == nil {
+		if token, okToken := findUsableToken(tokens, cfg.APIKeyName); okToken {
+			flow.APIKey = token.Key
+			flow.APIKeyID = token.ID
+			flow.APIKeyName = token.Name
+		}
+	}
+	if flow.APIKey == "" && strings.TrimSpace(cfg.APIKey) == "" {
+		if created, errCreate := client.createToken(ctx, cfg.APIKeyName); errCreate == nil {
+			flow.APIKey = created.Key
+			flow.APIKeyID = created.ID
+			flow.APIKeyName = created.Name
+		} else {
+			hostLog("warn", "agentrouter token provisioning failed", map[string]any{"error": errCreate.Error()})
+		}
+	}
+	if flow.APIKey == "" && strings.TrimSpace(cfg.APIKey) != "" {
+		flow.APIKey = cfg.APIKey
+	}
+	flow.Success = true
+	if flow.CheckedIn {
+		flow.Message = "登录成功，今日签到奖励已到账"
+	} else {
+		flow.Message = "登录成功"
+	}
+	return flow, nil
+}
+
 // checkinResult describes one check-in attempt for the management UI.
 type checkinResult struct {
 	Success      bool   `json:"success"`
@@ -188,37 +322,32 @@ type checkinResult struct {
 }
 
 // performCheckin runs the daily check-in. AgentRouter redeems the daily reward
-// on login, so the canonical flow is logout → login, then reading the account
-// balance to report the awarded amount.
+// on login, so the canonical flow is logout then login, then reading the
+// account balance to report the awarded amount.
 func performCheckin(ctx context.Context, cfg pluginConfig) (checkinResult, error) {
-	if !hasAccountCredentials(cfg) {
-		return checkinResult{}, fmt.Errorf("account credentials are not configured (username/password)")
-	}
 	result := checkinResult{Username: cfg.Username}
 	beforeQuota := int64(0)
 	if session, ok := cachedSession(cfg); ok {
-		beforeQuota, _ = fetchQuota(ctx, cfg, session)
+		beforeQuota = sessionQuota(ctx, cfg, session)
 	}
 	// Invalidating the old session is what makes the next login count as a
 	// fresh check-in on AgentRouter.
 	logoutDashboard(ctx, cfg)
 
-	session, errLogin := loginDashboard(ctx, cfg)
+	login, errLogin := loginDashboard(ctx, cfg)
 	if errLogin != nil {
 		result.Message = errLogin.Error()
 		return result, errLogin
 	}
-	storeSession(cfg, session)
-	if afterQuota, errQuota := fetchQuota(ctx, cfg, session); errQuota == nil {
-		result.QuotaAfter = afterQuota
-		if beforeQuota > 0 && afterQuota > beforeQuota {
-			result.QuotaAwarded = afterQuota - beforeQuota
-		}
+	storeSession(cfg, login.Session)
+	result.QuotaAfter = int64(login.Self.Quota)
+	if beforeQuota > 0 && result.QuotaAfter > beforeQuota {
+		result.QuotaAwarded = result.QuotaAfter - beforeQuota
 	}
 	result.Success = true
 	result.CheckinDate = time.Now().Format("2006-01-02")
 	result.CheckedInAt = time.Now().Format("2006-01-02 15:04:05")
-	if session.checkedIn {
+	if login.Checked {
 		result.Message = "签到成功，奖励已到账"
 		if result.QuotaAwarded > 0 {
 			result.Message = fmt.Sprintf("签到成功，获得 $%.2f", quotaToUSD(float64(result.QuotaAwarded)))
@@ -227,144 +356,189 @@ func performCheckin(ctx context.Context, cfg pluginConfig) (checkinResult, error
 		result.AlreadyDone = true
 		result.Message = "登录成功；今天可能已经签到过（AgentRouter 在登录时发放每日奖励）"
 	}
+	_, _ = updateState(cfg, func(state *pluginState) {
+		state.Account = mergeAccount(state.Account, login, cfg)
+		state.LastCheckin = &storedCheckin{
+			Success:      result.Success,
+			Message:      result.Message,
+			AlreadyDone:  result.AlreadyDone,
+			QuotaAwarded: quotaToUSD(float64(result.QuotaAwarded)),
+			QuotaAfter:   quotaToUSD(float64(result.QuotaAfter)),
+			CheckinDate:  result.CheckinDate,
+			Username:     cfg.Username,
+			CheckedInAt:  result.CheckedInAt,
+		}
+	})
 	return result, nil
 }
 
-// fetchQuota reads the account balance from the dashboard API.
-func fetchQuota(ctx context.Context, cfg pluginConfig, session dashboardSession) (int64, error) {
-	requestCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	endpoint := strings.TrimSuffix(cfg.BaseURL, "/") + "/api/user/self"
-	request, errRequest := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
-	if errRequest != nil {
-		return 0, errRequest
+// mergeAccount folds a successful login into the persisted account record,
+// keeping previously captured credentials when the new response omits them.
+func mergeAccount(existing *storedAccount, login loginResult, cfg pluginConfig) *storedAccount {
+	account := &storedAccount{}
+	if existing != nil {
+		*account = *existing
 	}
-	request.Header.Set("Cookie", session.cookie)
-	request.Header.Set("New-Api-User", session.userID)
-	request.Header.Set("Accept", "application/json")
-	request.Header.Set("User-Agent", cfg.UserAgent)
-	response, errDo := controlPlaneClient(cfg).Do(request)
-	if errDo != nil {
-		return 0, errDo
+	if login.UserID != "" {
+		account.UserID = login.UserID
 	}
-	defer response.Body.Close()
-	body, errRead := io.ReadAll(io.LimitReader(response.Body, 2<<20))
-	if errRead != nil {
-		return 0, errRead
+	if account.AccountToken == "" && strings.TrimSpace(cfg.AccountToken) != "" {
+		account.AccountToken = strings.TrimSpace(cfg.AccountToken)
 	}
-	if response.StatusCode != http.StatusOK {
-		return 0, newUpstreamError(response.StatusCode, summarizeUpstreamError(body))
+	account.Username = firstNonEmptyString(login.Self.Username, account.Username, cfg.Username)
+	account.DisplayName = firstNonEmptyString(login.Self.DisplayName, account.DisplayName)
+	account.Email = firstNonEmptyString(login.Self.Email, account.Email)
+	account.Group = firstNonEmptyString(login.Self.Group, account.Group)
+	if login.Self.Quota != 0 {
+		account.Quota = int64(login.Self.Quota)
 	}
-	var payload struct {
-		Success bool `json:"success"`
-		Data    struct {
-			Quota int64 `json:"quota"`
-		} `json:"data"`
+	if login.Self.UsedQuota != 0 {
+		account.UsedQuota = int64(login.Self.UsedQuota)
 	}
-	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
-		return 0, errUnmarshal
+	if login.Self.RequestCount != 0 {
+		account.RequestCount = login.Self.RequestCount
 	}
-	return payload.Data.Quota, nil
+	if login.Session.cookie != "" {
+		account.Session = login.Session.cookie
+	}
+	if login.Checked {
+		account.CheckedIn = true
+		account.CheckedInAt = time.Now().Format("2006-01-02 15:04:05")
+	}
+	account.LoginAt = unixNow()
+	return account
+}
+
+// sessionQuota reads the balance through the dashboard endpoints.
+func sessionQuota(ctx context.Context, cfg pluginConfig, session dashboardSession) int64 {
+	client := accountClient{cfg: cfg, userID: session.userID, session: session.cookie}
+	if user, errUser := client.fetchSelf(ctx); errUser == nil {
+		return int64(user.Quota)
+	}
+	return 0
 }
 
 // accountInfo is the shape returned to the dashboard account card.
 type accountInfo struct {
-	Username       string   `json:"username,omitempty"`
-	DisplayName    string   `json:"display_name,omitempty"`
-	Email          string   `json:"email,omitempty"`
-	Group          string   `json:"group,omitempty"`
-	QuotaUSD       float64  `json:"quota_usd"`
-	UsedUSD        float64  `json:"used_usd"`
-	RequestCount   int64    `json:"request_count"`
-	Models         []string `json:"models,omitempty"`
-	CheckedInToday *bool    `json:"checked_in_today,omitempty"`
-	Message        string   `json:"message,omitempty"`
+	Success      bool           `json:"success"`
+	Username     string         `json:"username,omitempty"`
+	DisplayName  string         `json:"display_name,omitempty"`
+	Email        string         `json:"email,omitempty"`
+	Group        string         `json:"group,omitempty"`
+	QuotaUSD     float64        `json:"quota_usd"`
+	UsedUSD      float64        `json:"used_usd"`
+	RequestCount int64          `json:"request_count"`
+	UserID       string         `json:"user_id,omitempty"`
+	Models       []string       `json:"models,omitempty"`
+	Groups       map[string]any `json:"groups,omitempty"`
+	CheckedIn    bool           `json:"checked_in"`
+	CheckedInAt  string         `json:"checked_in_at,omitempty"`
+	Authorized   bool           `json:"authorized"`
+	APIKeyMasked string         `json:"api_key_masked,omitempty"`
+	Message      string         `json:"message,omitempty"`
+	LastCheckin  any            `json:"last_checkin,omitempty"`
 }
 
-// fetchAccountInfo reads the account overview. Full account details need the
-// dashboard session; with only an API key the plugin returns the model list.
+// fetchAccountInfo reads the account overview through the dashboard API.
 func fetchAccountInfo(ctx context.Context, cfg pluginConfig) (accountInfo, error) {
+	client := newAccountClient(cfg)
 	info := accountInfo{}
 	if models, errModels := fetchAPIKeyModels(ctx, cfg); errModels == nil {
 		for _, model := range models {
 			info.Models = append(info.Models, model.ID)
 		}
 	}
-	if !hasAccountCredentials(cfg) {
-		info.Message = "配置 username/password 后可查看余额、分组与签到状态"
+	if state := cachedState(); state.Account != nil {
+		info.CheckedIn = state.Account.CheckedIn
+		info.CheckedInAt = state.Account.CheckedInAt
+		info.LastCheckin = state.LastCheckin
+	}
+	if !client.hasCredentials() && hasAccountCredentials(cfg) {
+		// No durable token yet: sign in once to obtain one.
+		flow, errAuth := authorizeAccount(ctx, cfg)
+		if errAuth != nil {
+			info.Message = errAuth.Error()
+			return info, nil
+		}
+		applyFlowToState(cfg, flow)
+		client = newAccountClient(effectiveConfig())
+	}
+	if !client.hasCredentials() {
+		info.Message = "账号尚未授权：点击「账号授权」登录 AgentRouter，或在配置中填写 account_token 与 user_id"
 		return info, nil
 	}
-	session, errLogin := ensureSession(ctx, cfg)
-	if errLogin != nil {
-		return info, errLogin
+	info.Authorized = true
+	user, errSelf := client.fetchSelf(ctx)
+	if errSelf != nil {
+		info.Message = errSelf.Error()
+		return info, nil
 	}
-	details, errDetails := fetchDashboardAccount(ctx, cfg, session)
-	if errDetails != nil {
-		return info, errDetails
+	info.Success = true
+	info.Username = user.Username
+	info.DisplayName = user.DisplayName
+	info.Email = user.Email
+	info.Group = user.Group
+	info.UserID = fmt.Sprint(user.ID)
+	info.QuotaUSD = quotaToUSD(user.Quota)
+	info.UsedUSD = quotaToUSD(user.UsedQuota)
+	info.RequestCount = user.RequestCount
+	if client.token == "" {
+		info.Message = "当前只有浏览器会话凭据，部分接口（令牌管理、签到）可能不可用；建议重新执行账号授权以获取访问令牌"
 	}
-	details.Models = info.Models
-	return details, nil
-}
-
-// fetchDashboardAccount reads /api/user/self for a logged-in dashboard session.
-func fetchDashboardAccount(ctx context.Context, cfg pluginConfig, session dashboardSession) (accountInfo, error) {
-	requestCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
-	defer cancel()
-	request, errRequest := http.NewRequestWithContext(requestCtx, http.MethodGet, strings.TrimSuffix(cfg.BaseURL, "/")+"/api/user/self", nil)
-	if errRequest != nil {
-		return accountInfo{}, errRequest
+	if groups, errGroups := client.fetchGroups(ctx); errGroups == nil {
+		info.Groups = groups
 	}
-	request.Header.Set("Cookie", session.cookie)
-	request.Header.Set("New-Api-User", session.userID)
-	request.Header.Set("Accept", "application/json")
-	request.Header.Set("User-Agent", cfg.UserAgent)
-	response, errDo := controlPlaneClient(cfg).Do(request)
-	if errDo != nil {
-		return accountInfo{}, errDo
-	}
-	defer response.Body.Close()
-	body, errRead := io.ReadAll(io.LimitReader(response.Body, 4<<20))
-	if errRead != nil {
-		return accountInfo{}, errRead
-	}
-	if response.StatusCode != http.StatusOK {
-		return accountInfo{}, newUpstreamError(response.StatusCode, summarizeUpstreamError(body))
-	}
-	var payload struct {
-		Success bool           `json:"success"`
-		Message string         `json:"message"`
-		Data    map[string]any `json:"data"`
-	}
-	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
-		return accountInfo{}, errUnmarshal
-	}
-	if !payload.Success {
-		return accountInfo{}, fmt.Errorf("%s", strings.TrimSpace(payload.Message))
-	}
-	info := accountInfo{}
-	info.Username, _ = payload.Data["username"].(string)
-	info.DisplayName, _ = payload.Data["display_name"].(string)
-	info.Email, _ = payload.Data["email"].(string)
-	info.Group, _ = payload.Data["group"].(string)
-	info.QuotaUSD = quotaToUSD(payload.Data["quota"])
-	info.UsedUSD = quotaToUSD(payload.Data["used_quota"])
-	if count, okCount := payload.Data["request_count"].(float64); okCount {
-		info.RequestCount = int64(count)
-	}
-	checkedIn := session.checkedIn
-	info.CheckedInToday = &checkedIn
+	info.APIKeyMasked = maskSecret(cfg.APIKey)
 	return info, nil
 }
 
-func quotaToUSD(value any) float64 {
-	number, ok := value.(float64)
-	if !ok {
-		return 0
-	}
-	return number / quotaPerUnit
+// applyFlowToState persists the credentials captured by authorizeAccount.
+func applyFlowToState(cfg pluginConfig, flow flowResult) {
+	_, _ = updateState(cfg, func(state *pluginState) {
+		account := &storedAccount{}
+		if state.Account != nil {
+			*account = *state.Account
+		}
+		if strings.TrimSpace(flow.Token) != "" {
+			account.AccountToken = strings.TrimSpace(flow.Token)
+			state.AccountToken = strings.TrimSpace(flow.Token)
+		}
+		if strings.TrimSpace(flow.UserID) != "" {
+			account.UserID = strings.TrimSpace(flow.UserID)
+			state.UserID = strings.TrimSpace(flow.UserID)
+		}
+		if strings.TrimSpace(flow.Session) != "" {
+			account.Session = strings.TrimSpace(flow.Session)
+		}
+		if strings.TrimSpace(flow.Username) != "" {
+			account.Username = strings.TrimSpace(flow.Username)
+			state.Username = strings.TrimSpace(flow.Username)
+		}
+		account.DisplayName = firstNonEmptyString(flow.DisplayName, account.DisplayName)
+		account.Email = firstNonEmptyString(flow.Email, account.Email)
+		account.Group = firstNonEmptyString(flow.Group, account.Group)
+		account.Quota = int64(flow.Quota * quotaPerUnit)
+		account.UsedQuota = int64(flow.Used * quotaPerUnit)
+		account.RequestCount = flow.Requests
+		if strings.TrimSpace(flow.APIKey) != "" {
+			account.APIKey = strings.TrimSpace(flow.APIKey)
+			account.APIKeyID = flow.APIKeyID
+			account.APIKeyName = flow.APIKeyName
+			if strings.TrimSpace(cfg.APIKey) == "" {
+				state.APIKey = strings.TrimSpace(flow.APIKey)
+			}
+		}
+		account.LoginAt = unixNow()
+		if flow.CheckedIn {
+			account.CheckedIn = true
+			account.CheckedInAt = time.Now().Format("2006-01-02 15:04:05")
+		}
+		state.Account = account
+		if state.APIKeyName == "" {
+			state.APIKeyName = cfg.APIKeyName
+		}
+	})
 }
-
-const quotaPerUnit = 500000.0
 
 // checkinSchedulerState triggers the configured automatic check-in after the
 // Beijing-time hour passes. It restarts whenever the plugin config reloads.
@@ -429,7 +603,7 @@ func (s *checkinSchedulerState) loop(generation uint64, cfg pluginConfig) {
 			time.Sleep(wait)
 		}
 		timer.Stop()
-		if _, errCheckin := performCheckin(context.Background(), cfg); errCheckin != nil {
+		if _, errCheckin := performCheckin(context.Background(), effectiveConfig()); errCheckin != nil {
 			hostLog("warn", "agentrouter automatic check-in failed", map[string]any{"error": errCheckin.Error()})
 		} else {
 			hostLog("info", "agentrouter automatic check-in completed", nil)

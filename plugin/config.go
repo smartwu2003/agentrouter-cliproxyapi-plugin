@@ -28,8 +28,12 @@ type modelSpec struct {
 
 // pluginConfig is the full plugin configuration parsed from plugins.configs.agentrouter.
 type pluginConfig struct {
-	// BaseURL is the AgentRouter API base URL (without /v1).
+	// BaseURL is the AgentRouter inference base URL (without /v1).
 	BaseURL string `yaml:"base_url"`
+	// DashboardBaseURL is the console/dashboard origin used for account APIs.
+	// The mainland mirror (ps.air-outer.com) is the direct-connect option; when
+	// its WAF blocks scripted calls the client retries on agentrouter.org.
+	DashboardBaseURL string `yaml:"dashboard_base_url"`
 	// APIKey authenticates inference and account calls.
 	APIKey string `yaml:"api_key"`
 	// UserAgent identifies the client to AgentRouter's gateway filter.
@@ -46,21 +50,32 @@ type pluginConfig struct {
 	Username string `yaml:"username"`
 	// Password is the AgentRouter account password used for check-in.
 	Password string `yaml:"password"`
+	// AccountToken is the New API system access token used for dashboard calls.
+	AccountToken string `yaml:"account_token"`
+	// UserID is the numeric New API user id required by the New-Api-User header.
+	UserID string `yaml:"user_id"`
 	// CheckinOnStartup runs a check-in attempt when the plugin is configured.
 	CheckinOnStartup bool `yaml:"checkin_on_startup"`
 	// CheckinHour is the Beijing hour gate for automatic check-ins.
 	CheckinHour int `yaml:"checkin_hour"`
+	// DataDir overrides where the plugin persists account state.
+	DataDir string `yaml:"data_dir"`
+	// APIKeyName is the AgentRouter token name the plugin creates for itself.
+	APIKeyName string `yaml:"api_key_name"`
 }
 
 const (
-	defaultBaseURL   = "https://ps.air-outer.com"
-	defaultUserAgent = "claude-cli/2.1.161 (external, cli)"
+	defaultBaseURL      = "https://ps.air-outer.com"
+	defaultDashboardURL = "https://ps.air-outer.com"
+	defaultUserAgent    = "claude-cli/2.1.161 (external, cli)"
+	defaultAPIKeyName   = "EasyCLIProxyAPI"
 )
 
 func defaultConfig() pluginConfig {
 	autoDiscover := true
 	return pluginConfig{
 		BaseURL:            defaultBaseURL,
+		DashboardBaseURL:   defaultDashboardURL,
 		UserAgent:          defaultUserAgent,
 		AutoDiscoverModels: &autoDiscover,
 		CheckinHour:        9,
@@ -80,6 +95,7 @@ func decodeConfig(raw []byte) (pluginConfig, error) {
 
 func normalizeConfig(cfg *pluginConfig) {
 	cfg.BaseURL = normalizeBaseURL(cfg.BaseURL)
+	cfg.DashboardBaseURL = normalizeBaseURL(cfg.DashboardBaseURL)
 	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
 	cfg.UserAgent = strings.TrimSpace(cfg.UserAgent)
 	if cfg.UserAgent == "" {
@@ -88,6 +104,13 @@ func normalizeConfig(cfg *pluginConfig) {
 	cfg.ProxyURL = strings.TrimSpace(cfg.ProxyURL)
 	cfg.Username = strings.TrimSpace(cfg.Username)
 	cfg.Password = strings.TrimSpace(cfg.Password)
+	cfg.AccountToken = strings.TrimSpace(cfg.AccountToken)
+	cfg.UserID = strings.TrimSpace(cfg.UserID)
+	cfg.DataDir = strings.TrimSpace(cfg.DataDir)
+	cfg.APIKeyName = strings.TrimSpace(cfg.APIKeyName)
+	if cfg.APIKeyName == "" {
+		cfg.APIKeyName = defaultAPIKeyName
+	}
 	if cfg.CheckinHour < 0 || cfg.CheckinHour > 23 {
 		cfg.CheckinHour = 9
 	}

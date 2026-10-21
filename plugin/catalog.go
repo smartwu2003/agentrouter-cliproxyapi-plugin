@@ -144,22 +144,40 @@ func resolveModels(cfg pluginConfig) []modelSpec {
 	}
 	for _, item := range discovered {
 		capability := capabilityForModel(item.ID)
+		modalities := capability.InputModalities
+		if len(item.SupportedInputModalities) > 0 {
+			modalities = append([]string(nil), item.SupportedInputModalities...)
+		}
 		add(modelSpec{
 			Name:                item.ID,
 			DisplayName:         item.DisplayName,
 			ContextLength:       item.ContextLength,
 			MaxCompletionTokens: item.MaxCompletionTokens,
 			Protocols:           capability.Protocols,
+			InputModalities:     modalities,
 		})
 	}
 	if len(order) == 0 {
-		// Nothing configured and discovery disabled: publish the capability
-		// table so the host has a usable catalogue.
-		for name := range knownModelCapabilities {
-			order = append(order, name)
+		// Nothing configured and discovery disabled: publish curated models but
+		// never include models the account already lost access to. The account
+		// model list is cheap and authoritative for availability.
+		curated := make([]string, 0, len(knownModelCapabilities))
+		accountModels, errModels := fetchAccountModelNames(effectiveConfig())
+		if errModels == nil {
+			for _, name := range accountModels {
+				if _, ok := knownModelCapabilities[strings.ToLower(name)]; ok {
+					curated = append(curated, name)
+				}
+			}
 		}
-		sort.Strings(order)
-		for _, name := range order {
+		if len(curated) == 0 {
+			for name := range knownModelCapabilities {
+				curated = append(curated, name)
+			}
+		}
+		sort.Strings(curated)
+		order = append(order, curated...)
+		for _, name := range curated {
 			byAlias[name] = modelSpec{Name: name, Protocols: capabilityForModel(name).Protocols}
 		}
 	}
@@ -448,7 +466,7 @@ func fetchAPIKeyModels(ctx context.Context, cfg pluginConfig) ([]pluginapi.Model
 func fetchPricing(ctx context.Context, cfg pluginConfig) (*pricingResponse, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	url := strings.TrimSuffix(cfg.BaseURL, "/") + "/api/pricing"
+	url := controlEndpoint(cfg, "/api/pricing")
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -540,4 +558,63 @@ func primeCatalogue(cfg pluginConfig) {
 	if _, errRefresh := refreshCatalogue(ctx, cfg); errRefresh != nil {
 		hostLog("warn", "agentrouter model discovery failed", map[string]any{"error": errRefresh.Error()})
 	}
+}
+
+// fetchAnnouncements reads the public site announcements so the dashboard can
+// mirror what the AgentRouter console shows.
+func fetchAnnouncements(ctx context.Context, cfg pluginConfig) ([]map[string]any, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	request, errRequest := http.NewRequestWithContext(reqCtx, http.MethodGet, controlEndpoint(cfg, "/api/status"), nil)
+	if errRequest != nil {
+		return nil, errRequest
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", cfg.UserAgent)
+	response, errDo := controlPlaneClient(cfg).Do(request)
+	if errDo != nil {
+		return nil, errDo
+	}
+	defer response.Body.Close()
+	body, errRead := io.ReadAll(io.LimitReader(response.Body, 8<<20))
+	if errRead != nil {
+		return nil, errRead
+	}
+	if response.StatusCode != http.StatusOK {
+		return nil, newUpstreamError(response.StatusCode, summarizeUpstreamError(body))
+	}
+	var payload struct {
+		Data struct {
+			Announcements []struct {
+				ID          int    `json:"id"`
+				Content     string `json:"content"`
+				PublishDate string `json:"publishDate"`
+				Type        string `json:"type"`
+			} `json:"announcements"`
+		} `json:"data"`
+	}
+	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
+		return nil, errUnmarshal
+	}
+	out := make([]map[string]any, 0, len(payload.Data.Announcements))
+	for _, item := range payload.Data.Announcements {
+		out = append(out, map[string]any{
+			"id":           item.ID,
+			"content":      item.Content,
+			"publish_date": item.PublishDate,
+			"type":         item.Type,
+		})
+	}
+	return out, nil
+}
+
+// fetchAccountModelNames lists the models the account can currently use.
+func fetchAccountModelNames(cfg pluginConfig) ([]string, error) {
+	client := newAccountClient(cfg)
+	if !client.hasCredentials() {
+		return nil, errAccountNotAuthorized
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	return client.fetchModels(ctx)
 }
