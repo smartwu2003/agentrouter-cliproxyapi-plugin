@@ -1,0 +1,16 @@
+# Minimal snippet to enable the AgentRouter plugin.
+plugins:
+  enabled: true
+  dir: "plugins"
+  configs:
+    agentrouter:
+      enabled: true
+      priority: 10
+      base_url: "https://ps.air-outer.com"
+      api_key: "sk-replace-me"
+      user_agent: "claude-cli/2.1.161 (external, cli)"
+      auto_discover_models: true
+      username: ""
+      password: ""
+      checkin_on_startup: false
+      checkin_hour: 9

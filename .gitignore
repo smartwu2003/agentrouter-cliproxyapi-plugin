@@ -1,0 +1,6 @@
+dist/
+testrun/
+*.dll
+*.dylib
+*.so
+*.h
