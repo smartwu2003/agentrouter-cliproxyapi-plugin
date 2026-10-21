@@ -3,7 +3,7 @@
 把 [AgentRouter](https://agentrouter.org) 公益站接入 CLIProxyAPI（EasyCLIProxyAPI 内核）。插件以原生动态库形式运行，提供：
 
 - **模型目录**：启动时用 API Key 从 AgentRouter 拉取当前可用模型，并按模型自动选择上游协议（Chat Completions / Responses / Anthropic Messages）。
-- **执行器**：把客户端请求翻译成 AgentRouter 需要的协议，透传工具调用、思考内容与流式增量；响应翻译回客户端协议（OpenAI Chat、OpenAI Responses、Claude Messages 互转）。
+- **执行器**：把客户端请求翻译成 AgentRouter 需要的协议，透传工具调用、图片输入、思考内容与流式增量；响应翻译回客户端协议（OpenAI Chat、OpenAI Responses、Claude Messages 互转）。
 - **User-Agent**：AgentRouter 会拒绝未识别的客户端。插件为每个上游请求附带可配置的客户端标识（默认 `claude-cli/2.1.161 (external, cli)`）。
 - **管理页面**：在 EasyCLIProxyAPI 侧边栏出现「AgentRouter」页面，可查询账号余额/分组、刷新模型列表、做连通性测试、以及一键签到。
 - **每日签到**：AgentRouter 在登录时发放当日奖励，因此签到的正确流程是「退出登录 → 重新登录」。插件按此流程实现，并支持定时自动签到（北京时间）。
@@ -67,6 +67,7 @@ plugins:
       #   - name: deepseek-v4-flash
       #     alias: fast
       #     protocols: [openai, anthropic]
+      #     input_modalities: [text, image]      # 覆盖模型输入端能力（默认按内置表推断）
 ```
 
 3. 重启内核（EasyCLIProxyAPI 里重启服务），确认 `GET /v0/management/plugins` 中 `registered` 与 `effective_enabled` 均为 `true`。
@@ -128,6 +129,15 @@ Claude Code 这样配置（与代理一样走 EasyCLIProxyAPI）：
 - 协议转换使用 SDK 内置翻译器（`sdk/translator/builtin`）。Responses 上游在跨协议时以 Codex 语法作为中间格式，因为内置表只提供 Codex→Claude / Codex→OpenAI 的响应转换。
 - 上游流量默认通过宿主 HTTP 客户端发出，便于请求日志与代理策略；模型目录、账号、签到这类控制面请求使用插件自己的客户端（可单独配置 `proxy_url`）。
 - 签到逻辑：AgentRouter 基于 New API，每日奖励在登录流程内发放。插件先调用 `/api/user/logout`，再 `/api/user/login`，读取响应中的 `checked_in`，并用登录前后的余额差报告奖励金额。
+
+## 图片输入
+
+AgentRouter 的模型都支持图片输入（已用红方块/蓝圆点测试图实测）：
+
+- `deepseek-v4-flash`、`gpt-6.1-sol`、Claude 系列均已验证可识别图片；
+- `gpt-6-astra` 的 Responses 接口同样接受 `input_image`，但额度池紧张时会先返回 402。
+
+插件会在模型列表里公开 `image` 输入能力，客户端（OpenAI `image_url`、Anthropic `image` 块）的图片会原样经内置翻译器送达上游；如需关闭，用 `input_modalities: [text]` 覆盖某个模型。
 
 ## 已知问题
 

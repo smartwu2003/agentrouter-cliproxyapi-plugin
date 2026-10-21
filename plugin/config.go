@@ -22,6 +22,8 @@ type modelSpec struct {
 	Protocols []string `yaml:"protocols" json:"protocols"`
 	// Alias overrides the client-visible model ID (defaults to Name).
 	Alias string `yaml:"alias" json:"alias"`
+	// InputModalities overrides advertised input types (text, image).
+	InputModalities []string `yaml:"input_modalities" json:"input_modalities"`
 }
 
 // pluginConfig is the full plugin configuration parsed from plugins.configs.agentrouter.
@@ -121,6 +123,20 @@ func normalizeConfig(cfg *pluginConfig) {
 			protocols = append(protocols, protocol)
 		}
 		item.Protocols = protocols
+		modalities := make([]string, 0, len(item.InputModalities))
+		seenModalities := make(map[string]struct{}, len(item.InputModalities))
+		for _, modality := range item.InputModalities {
+			modality = strings.ToLower(strings.TrimSpace(modality))
+			if modality != "text" && modality != "image" {
+				continue
+			}
+			if _, exists := seenModalities[modality]; exists {
+				continue
+			}
+			seenModalities[modality] = struct{}{}
+			modalities = append(modalities, modality)
+		}
+		item.InputModalities = modalities
 		models = append(models, item)
 	}
 	cfg.Models = models

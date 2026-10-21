@@ -69,3 +69,45 @@ func TestResolveModelsPrefersConfiguredAlias(t *testing.T) {
 		t.Fatalf("model = %#v", models[0])
 	}
 }
+
+func TestInferCapabilityAdvertisesImagesForMultimodalFamilies(t *testing.T) {
+	for _, model := range []string{"deepseek-v4-flash", "gpt-6-astra", "claude-opus-5", "glm-5.3"} {
+		modalities := inferCapability(model).InputModalities
+		found := false
+		for _, modality := range modalities {
+			if modality == "image" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%s should advertise image input, got %v", model, modalities)
+		}
+	}
+}
+
+func TestModelInfoForCarriesImageModality(t *testing.T) {
+	info := modelInfoFor(modelSpec{Name: "deepseek-v4-flash"})
+	found := false
+	for _, modality := range info.SupportedInputModalities {
+		if modality == "image" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("model info modalities = %v", info.SupportedInputModalities)
+	}
+}
+
+func TestModelSpecModalityOverride(t *testing.T) {
+	cfg, err := decodeConfig([]byte("models:\n  - name: deepseek-v4-flash\n    input_modalities: [text]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Models) != 1 || len(cfg.Models[0].InputModalities) != 1 || cfg.Models[0].InputModalities[0] != "text" {
+		t.Fatalf("override = %#v", cfg.Models)
+	}
+	info := modelInfoFor(cfg.Models[0])
+	if len(info.SupportedInputModalities) != 1 || info.SupportedInputModalities[0] != "text" {
+		t.Fatalf("published modalities = %v", info.SupportedInputModalities)
+	}
+}

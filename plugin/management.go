@@ -116,6 +116,7 @@ func modelsResponse() pluginapi.ManagementResponse {
 			"protocols":             spec.Protocols,
 			"context_length":        spec.ContextLength,
 			"max_completion_tokens": spec.MaxCompletionTokens,
+			"input_modalities":      inputModalitiesFor(spec),
 		})
 	}
 	_, lastSync, lastErr := catalogueSnapshot()

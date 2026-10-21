@@ -4,3 +4,4 @@ testrun/
 *.dylib
 *.so
 *.h
+plugin/server.log

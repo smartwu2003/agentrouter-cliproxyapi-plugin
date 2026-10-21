@@ -25,19 +25,24 @@ type modelCapability struct {
 	ContextLength int64
 	// MaxCompletionTokens is the advertised output limit.
 	MaxCompletionTokens int64
+	// InputModalities lists accepted input types (text, image).
+	InputModalities []string
 }
 
+var textOnly = []string{"text"}
+var textAndImage = []string{"text", "image"}
+
 var knownModelCapabilities = map[string]modelCapability{
-	"deepseek-v4-flash": {Protocols: []string{protocolOpenAI, protocolAnthropic}, ContextLength: 1_000_000, MaxCompletionTokens: 256_000},
-	"gpt-6-astra":       {Protocols: []string{protocolResponses}, ContextLength: 272_000, MaxCompletionTokens: 128_000},
-	"gpt-6.1-sol":       {Protocols: []string{protocolResponses}, ContextLength: 272_000, MaxCompletionTokens: 128_000},
-	"gpt-5.6-sol":       {Protocols: []string{protocolResponses}, ContextLength: 272_000, MaxCompletionTokens: 128_000},
-	"gpt-6-sol":         {Protocols: []string{protocolResponses}, ContextLength: 272_000, MaxCompletionTokens: 128_000},
-	"gpt-6-luna":        {Protocols: []string{protocolResponses}, ContextLength: 272_000, MaxCompletionTokens: 128_000},
-	"claude-opus-5":     {Protocols: []string{protocolAnthropic, protocolOpenAI}, ContextLength: 1_000_000, MaxCompletionTokens: 128_000},
-	"claude-opus-5-5":   {Protocols: []string{protocolAnthropic, protocolOpenAI}, ContextLength: 1_000_000, MaxCompletionTokens: 128_000},
-	"claude-opus-4-8":   {Protocols: []string{protocolAnthropic, protocolOpenAI}, ContextLength: 1_000_000, MaxCompletionTokens: 128_000},
-	"glm-5.3":           {Protocols: []string{protocolOpenAI, protocolAnthropic}, ContextLength: 200_000, MaxCompletionTokens: 128_000},
+	"deepseek-v4-flash": {Protocols: []string{protocolOpenAI, protocolAnthropic}, ContextLength: 1_000_000, MaxCompletionTokens: 256_000, InputModalities: textAndImage},
+	"gpt-6-astra":       {Protocols: []string{protocolResponses}, ContextLength: 272_000, MaxCompletionTokens: 128_000, InputModalities: textAndImage},
+	"gpt-6.1-sol":       {Protocols: []string{protocolResponses}, ContextLength: 272_000, MaxCompletionTokens: 128_000, InputModalities: textAndImage},
+	"gpt-5.6-sol":       {Protocols: []string{protocolResponses}, ContextLength: 272_000, MaxCompletionTokens: 128_000, InputModalities: textAndImage},
+	"gpt-6-sol":         {Protocols: []string{protocolResponses}, ContextLength: 272_000, MaxCompletionTokens: 128_000, InputModalities: textAndImage},
+	"gpt-6-luna":        {Protocols: []string{protocolResponses}, ContextLength: 272_000, MaxCompletionTokens: 128_000, InputModalities: textAndImage},
+	"claude-opus-5":     {Protocols: []string{protocolAnthropic, protocolOpenAI}, ContextLength: 1_000_000, MaxCompletionTokens: 128_000, InputModalities: textAndImage},
+	"claude-opus-5-5":   {Protocols: []string{protocolAnthropic, protocolOpenAI}, ContextLength: 1_000_000, MaxCompletionTokens: 128_000, InputModalities: textAndImage},
+	"claude-opus-4-8":   {Protocols: []string{protocolAnthropic, protocolOpenAI}, ContextLength: 1_000_000, MaxCompletionTokens: 128_000, InputModalities: textAndImage},
+	"glm-5.3":           {Protocols: []string{protocolOpenAI, protocolAnthropic}, ContextLength: 200_000, MaxCompletionTokens: 128_000, InputModalities: textAndImage},
 }
 
 // catalogueEntry is the cached result of a live model discovery.
@@ -69,10 +74,10 @@ type pricingEntry struct {
 }
 
 type pricingResponse struct {
-	Data    []pricingEntry  `json:"data"`
-	Success bool            `json:"success"`
-	Message string          `json:"message"`
-	Groups  map[string]any  `json:"group_ratio"`
+	Data    []pricingEntry `json:"data"`
+	Success bool           `json:"success"`
+	Message string         `json:"message"`
+	Groups  map[string]any `json:"group_ratio"`
 }
 
 type apiModelEntry struct {
@@ -190,6 +195,7 @@ func modelInfoFor(spec modelSpec) pluginapi.ModelInfo {
 	if display == "" {
 		display = spec.Name
 	}
+	modalities := inputModalitiesFor(spec)
 	return pluginapi.ModelInfo{
 		ID:                         modelClientName(spec),
 		Object:                     "model",
@@ -203,10 +209,22 @@ func modelInfoFor(spec modelSpec) pluginapi.ModelInfo {
 		InputTokenLimit:            spec.ContextLength,
 		OutputTokenLimit:           spec.MaxCompletionTokens,
 		SupportedGenerationMethods: []string{"chat", "responses", "messages"},
-		SupportedInputModalities:   []string{"text"},
+		SupportedInputModalities:   modalities,
 		SupportedOutputModalities:  []string{"text"},
 		UserDefined:                true,
 	}
+}
+
+// inputModalitiesFor returns the advertised input modalities for a model.
+func inputModalitiesFor(spec modelSpec) []string {
+	if len(spec.InputModalities) > 0 {
+		return spec.InputModalities
+	}
+	capability := capabilityForModel(spec.Name)
+	if len(capability.InputModalities) > 0 {
+		return capability.InputModalities
+	}
+	return textOnly
 }
 
 func capabilityForModel(name string) modelCapability {
@@ -239,10 +257,17 @@ func inferCapability(name string) modelCapability {
 	if strings.Contains(lower, "deepseek") || strings.Contains(lower, "opus") || strings.Contains(lower, "gpt-6") || strings.Contains(lower, "1m") {
 		contextLength = 1_000_000
 	}
+	modalities := textOnly
+	if strings.Contains(lower, "claude") || strings.Contains(lower, "gpt") || strings.Contains(lower, "gemini") ||
+		strings.Contains(lower, "glm") || strings.Contains(lower, "qwen") || strings.Contains(lower, "kimi") ||
+		strings.Contains(lower, "deepseek") || strings.Contains(lower, "vision") || strings.Contains(lower, "multimodal") {
+		modalities = textAndImage
+	}
 	return modelCapability{
 		Protocols:           protocols,
 		ContextLength:       contextLength,
 		MaxCompletionTokens: 32_768,
+		InputModalities:     modalities,
 	}
 }
 
@@ -340,6 +365,7 @@ func refreshCatalogue(ctx context.Context, cfg pluginConfig) ([]pluginapi.ModelI
 			Protocols:           protocols,
 			ContextLength:       base.ContextLength,
 			MaxCompletionTokens: base.MaxCompletionTokens,
+			InputModalities:     base.InputModalities,
 		}
 	}
 	now := time.Now()
@@ -408,7 +434,7 @@ func fetchAPIKeyModels(ctx context.Context, cfg pluginConfig) ([]pluginapi.Model
 			Name:                       id,
 			ContextLength:              capability.ContextLength,
 			MaxCompletionTokens:        capability.MaxCompletionTokens,
-			SupportedInputModalities:   []string{"text"},
+			SupportedInputModalities:   capability.InputModalities,
 			SupportedOutputModalities:  []string{"text"},
 			SupportedGenerationMethods: []string{"chat", "responses", "messages"},
 			UserDefined:                true,

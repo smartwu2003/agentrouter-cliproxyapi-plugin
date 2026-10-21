@@ -521,13 +521,13 @@ func copyClientHeaders(dst *http.Request, src http.Header) {
 		return
 	}
 	pass := map[string]bool{
-		"X-Claude-Code-Session-Id":     true,
-		"X-Stainless-Lang":             true,
-		"X-Stainless-Package-Version":  true,
-		"X-Stainless-Runtime":          true,
-		"X-Stainless-Runtime-Version":  true,
-		"X-Stainless-Os":               true,
-		"X-Stainless-Arch":             true,
+		"X-Claude-Code-Session-Id":    true,
+		"X-Stainless-Lang":            true,
+		"X-Stainless-Package-Version": true,
+		"X-Stainless-Runtime":         true,
+		"X-Stainless-Runtime-Version": true,
+		"X-Stainless-Os":              true,
+		"X-Stainless-Arch":            true,
 	}
 	for name, values := range src {
 		if !pass[http.CanonicalHeaderKey(name)] || len(values) == 0 {
