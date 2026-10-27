@@ -8,7 +8,7 @@
 - **视觉控制台**：EasyCLIProxyAPI 侧边栏的「AgentRouter」页面提供「概览 / 数据看板 / 模型 / 使用日志 / 账号与授权 / 设置」六个页签，把官网的余额、消耗趋势、模型列表、使用日志、签到与公告整合进来。
 - **账号授权**：插件卡片上的「账号授权」按钮会打开本机授权页：可以用账号密码登录，也可以粘贴官网「个人设置 → 系统令牌」的访问令牌，或直接粘贴浏览器 `session` Cookie（GitHub/LinuxDO 登录的账号没有密码，用会话即可读取看板）。
 - **可编辑配置**：页面里能直接改 User-Agent、API Key、代理、签到账号并保存到插件状态文件，不需要手改 YAML。
-- **每日签到**：AgentRouter 在登录时发放当日奖励，因此签到的正确流程是「退出登录 → 重新登录」。插件按此流程实现，并支持定时自动签到（北京时间）。
+- **每日签到**：AgentRouter 在登录时发放当日奖励，因此签到的正确流程是「退出登录 → 重新登录」。插件按此流程实现，并支持定时自动签到（北京时间）。签到状态以官网「签到」类型的使用日志为准，按北京时间跨日重置；即使是在官网手动签到，这里也会显示「已签到」和奖励金额。
 
 ## 适用范围与限制
 
@@ -16,7 +16,7 @@
 - AgentRouter 的模型上下线很快，内置表只用于兜底；始终以 `/console/personal` 与管理页里的实时列表为准。
 - **Claude 模型**既支持 Anthropic 原生协议，也支持 OpenAI 协议；**GPT-6 系列只支持 Responses**；DeepSeek/GLM 支持 OpenAI 与 Anthropic 两种协议。插件按模型自动选择，客户端用哪种协议进来都能得到对应协议的回复。
 - 签到依赖账号密码（`username` / `password`）。GitHub/LinuxDO 登录的账号没有密码，可粘贴浏览器会话或系统令牌作为只读看板凭据，但「退出 → 登录」签到仍需要密码；站方若开启 Turnstile 人机验证，签到会失败并提示原因。
-- AgentRouter 的控制台域名前有阿里云 WAF，脚本调用可能被随机拦截（返回 HTML 挑战页）。插件会自动延迟重试并切换到另一个域名；长期被拦截时在设置里配置 `proxy_url` 走代理访问 `https://agentrouter.org` 即可。
+- **两个源站各管一摊**：`ps.air-outer.com` 国内直连、承载推理，但它的 `/api/*` 控制台接口最容易触发阿里云 WAF；`agentrouter.org` 是控制台正名，国内 DNS 被污染，必须走代理。插件按这个规则自动选路（见下文「网络与源站」），不需要手工来回改。
 
 ## 构建
 
@@ -55,7 +55,7 @@ plugins:
     agentrouter:
       enabled: true
       priority: 10
-      base_url: "https://ps.air-outer.com"     # 国内直连域名；海外/有代理时可用 https://agentrouter.org
+      base_url: "https://ps.air-outer.com"     # 推理源站：国内直连；填 agentrouter.org 时会自动走 proxy_url
       api_key: "sk-..."                        # https://ps.air-outer.com/console/token 创建
       user_agent: "claude-cli/2.1.161 (external, cli)"
       auto_discover_models: true
@@ -64,10 +64,10 @@ plugins:
       checkin_on_startup: false
       checkin_hour: 9                          # 北京时间 09:00 后自动签到
       # 以下都可以留空，在插件页面的「设置 / 账号与授权」里填写，保存到插件状态文件：
-      # dashboard_base_url: "https://ps.air-outer.com"  # 控制台域名（WAF 拦截时自动改用 agentrouter.org）
+      # dashboard_base_url: "https://agentrouter.org"   # 控制台源站：配合 proxy_url 最稳（WAF 会自动换源）
       # account_token: "..."                   # 系统令牌（个人设置页），配置后无需密码也能看看板
       # user_id: "123456"                      # New-Api-User，配合 account_token 使用
-      # proxy_url: "http://127.0.0.1:7890"     # 仅用于控制面请求（模型列表/账号/签到）
+      # proxy_url: "http://127.0.0.1:7890"     # 只作用于需要代理的源站（agentrouter.org），国内源站始终直连
       # model_protocols:
       #   deepseek-v4-flash: openai            # 强制某个模型走上游协议
       # models:                                # 手动指定模型（留空则完全依赖自动发现）
@@ -83,7 +83,7 @@ plugins:
 ## 界面与响应速度
 
 - 控制台采用 1160px 居中布局、分段式页签、卡片标题分隔、语义化状态胶囊、骨架屏与 160ms 过渡（跟随系统深/浅色）。
-- 页面数据按 90 秒 TTL 缓存（内存 + sessionStorage），切页先渲染缓存再后台刷新；手动刷新按钮发送 `?refresh=1` 跳过缓存。
+- 页面数据按 90 秒 TTL 缓存（内存 + sessionStorage），切页先渲染缓存再后台刷新；手动刷新按钮发送 `?refresh=1` 跳过缓存。使用日志表格固定列宽：时间与模型单行显示、类型徽章不换行、Token 与金额右对齐，详情过长时省略并在悬停时显示全文。
 - 后端对看板/日志/账号/公告/令牌接口做并行拉取 + TTL 缓存（15s/15s/20s/120s/30s）并合并并发相同请求；实测看板接口二次请求从 ~0.9s 降到 ~55ms。
 - 登录、保存令牌/配置、签到后会清空相关缓存；页面隐藏时暂停看板轮询，返回时自动刷新一次。
 
@@ -96,6 +96,39 @@ plugins:
 3. 插件把拿到的访问令牌和用户 ID 写入插件状态文件，并自动复用或创建一个名为 `EasyCLIProxyAPI` 的无限额度 API 令牌作为推理密钥（若尚未配置 API Key）。
 
 授权完成后侧边栏页面即可看到余额、历史消耗、请求次数、7/30/90 天消耗趋势、按模型统计、使用日志（消费/错误/签到分类）、API 令牌列表与签到状态。
+
+## 网络与源站（重点）
+
+AgentRouter 的同一个账号挂在两个源站上，二者能力并不对称：
+
+| 源站 | 大陆直连 | 推理 `/v1/*` | 控制台 `/api/*` | 定位 |
+| --- | --- | --- | --- | --- |
+| `https://ps.air-outer.com` | ✅ 可达 | ✅ 稳定 | ⚠️ 常被阿里云 WAF 拦 | 国内默认推理源站 |
+| `https://agentrouter.org` | ❌ DNS 被污染 | 必须走代理 | ✅ 走代理稳定 | 控制台正名 |
+
+插件据此自动选路，规则只有四条：
+
+1. **推理**先试上次成功的源站，再试配置的 `base_url`，最后试另一个源站。只有「连不上」（DNS / TCP / TLS / 代理 CONNECT 失败）才换源；HTTP 4xx/5xx 原样返回，不会把同一请求重复发出去再扣一次额度。
+2. **代理只作用于需要代理的源站**：`proxy_url` 只给 `agentrouter.org` 用，`ps.air-outer.com` 始终直连——把国内源站塞进海外代理反而更容易招来 WAF。
+3. **控制台**（账号 / 看板 / 签到）遇到 WAF 挑战页或连不上时自动换源，并记住能用的那个 10 分钟。
+4. 刚失败过的源站会被冷落 2 分钟，避免每个请求都先卡一次 20 秒超时。
+
+于是下面两种配置都成立：
+
+```yaml
+# A. 国内直连推理 + 代理看板（默认推荐）
+base_url: "https://ps.air-outer.com"
+dashboard_base_url: "https://agentrouter.org"
+proxy_url: "http://127.0.0.1:7897"
+
+# B. 全部走代理：base_url 填 agentrouter.org 时，推理会自动改走 proxy_url
+base_url: "https://agentrouter.org"
+proxy_url: "http://127.0.0.1:7897"
+```
+
+> 旧版本把 `base_url` 填成 `agentrouter.org` 时，推理会直连一个被污染的域名，
+> 表现为 `dial tcp [2a03:2880:...]:443` 连接超时。现在这条路径会自动走代理，
+> 代理不可用时再换到国内源站，不再出现「看板能开、模型用不了」的半死状态。
 
 ## 客户端使用
 
@@ -151,7 +184,7 @@ Claude Code 这样配置（与代理一样走 EasyCLIProxyAPI）：
 - 请求路由：插件注册 `model_router`，只有 AgentRouter 目录中的模型才由插件执行，其他模型仍走内核内置 provider。
 - 上游协议选择：`model_protocols` 显式覆盖 > 已知模型能力表 > 从模型名推断。多协议模型优先跟随客户端协议（例如 Claude Code 用 `/v1/messages` 进来时，DeepSeek 走 Anthropic 上游）。
 - 协议转换使用 SDK 内置翻译器（`sdk/translator/builtin`）。Responses 上游在跨协议时以 Codex 语法作为中间格式，因为内置表只提供 Codex→Claude / Codex→OpenAI 的响应转换。
-- 上游流量默认通过宿主 HTTP 客户端发出，便于请求日志与代理策略；模型目录、账号、签到这类控制面请求使用插件自己的客户端（可单独配置 `proxy_url`）。
+- 上游流量默认通过宿主 HTTP 客户端发出，便于请求日志与代理策略；例外是 `agentrouter.org` 这类必须走代理的源站，插件会用自己的、带 `proxy_url` 的客户端发送（否则大陆直连必然超时）。模型目录、账号、签到这类控制面请求同样按源站决定是否走代理。
 - 签到逻辑：AgentRouter 基于 New API，每日奖励在登录流程内发放。插件先调用 `/api/user/logout`，再 `/api/user/login`，读取响应中的 `checked_in`，并用登录前后的余额差报告奖励金额。
 
 ## 图片输入

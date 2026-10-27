@@ -13,22 +13,23 @@ import (
 // The session cookie is short-lived; the access token is the long-lived New
 // API credential used for dashboard calls after login.
 type storedAccount struct {
-	Username     string `json:"username,omitempty"`
-	DisplayName  string `json:"display_name,omitempty"`
-	Email        string `json:"email,omitempty"`
-	Group        string `json:"group,omitempty"`
-	UserID       string `json:"user_id,omitempty"`
-	AccountToken string `json:"account_token,omitempty"`
-	Session      string `json:"session,omitempty"`
-	Quota        int64  `json:"quota,omitempty"`
-	UsedQuota    int64  `json:"used_quota,omitempty"`
-	RequestCount int64  `json:"request_count,omitempty"`
-	CheckedIn    bool   `json:"checked_in,omitempty"`
-	CheckedInAt  string `json:"checked_in_at,omitempty"`
-	LoginAt      int64  `json:"login_at,omitempty"`
-	APIKey       string `json:"api_key,omitempty"`
-	APIKeyID     int64  `json:"api_key_id,omitempty"`
-	APIKeyName   string `json:"api_key_name,omitempty"`
+	Username      string `json:"username,omitempty"`
+	DisplayName   string `json:"display_name,omitempty"`
+	Email         string `json:"email,omitempty"`
+	Group         string `json:"group,omitempty"`
+	UserID        string `json:"user_id,omitempty"`
+	AccountToken  string `json:"account_token,omitempty"`
+	Session       string `json:"session,omitempty"`
+	Quota         int64  `json:"quota,omitempty"`
+	UsedQuota     int64  `json:"used_quota,omitempty"`
+	RequestCount  int64  `json:"request_count,omitempty"`
+	CheckedIn     bool   `json:"checked_in,omitempty"`
+	CheckedInAt   string `json:"checked_in_at,omitempty"`
+	CheckedInDate string `json:"checked_in_date,omitempty"`
+	LoginAt       int64  `json:"login_at,omitempty"`
+	APIKey        string `json:"api_key,omitempty"`
+	APIKeyID      int64  `json:"api_key_id,omitempty"`
+	APIKeyName    string `json:"api_key_name,omitempty"`
 }
 
 // storedCheckin is the last check-in attempt reported to the dashboard.
@@ -106,6 +107,11 @@ func loadState(cfg pluginConfig) pluginState {
 func saveState(cfg pluginConfig, state pluginState) error {
 	pluginStore.mu.Lock()
 	defer pluginStore.mu.Unlock()
+	return saveStateLocked(cfg, state)
+}
+
+// saveStateLocked writes the state while pluginStore.mu is already held.
+func saveStateLocked(cfg pluginConfig, state pluginState) error {
 	path := pluginStore.path
 	if path == "" {
 		path = statePath(cfg)
@@ -152,11 +158,15 @@ func cachedState() pluginState {
 	return pluginStore.data
 }
 
-// updateState mutates the cached state under the store lock and persists it.
+// updateState mutates and persists the state under one lock, so concurrent
+// writers (login, settings save, daily check-in persistence) never lose each
+// other's fields by read-modify-writing a stale snapshot.
 func updateState(cfg pluginConfig, mutate func(*pluginState)) (pluginState, error) {
-	current := cachedState()
+	pluginStore.mu.Lock()
+	defer pluginStore.mu.Unlock()
+	current := pluginStore.data
 	mutate(&current)
-	if errSave := saveState(cfg, current); errSave != nil {
+	if errSave := saveStateLocked(cfg, current); errSave != nil {
 		return current, errSave
 	}
 	return current, nil

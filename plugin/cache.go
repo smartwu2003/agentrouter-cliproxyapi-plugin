@@ -181,8 +181,14 @@ func invalidateManagementCache() {
 // A refresh skips both the cache and coalescing: it must observe upstream now.
 func (s *responseStore) serve(key string, ttl time.Duration, refresh bool, fetch func() (map[string]any, int, bool)) pluginapi.ManagementResponse {
 	if refresh {
-		payload, status, _ := fetch()
-		return jsonResponse(status, withCachedFlag(payload, false))
+		payload, status, cacheable := fetch()
+		result := withCachedFlag(payload, false)
+		// A forced refresh must also replace the normal entry; otherwise the next
+		// ordinary read would serve the pre-refresh snapshot for a whole TTL.
+		if cacheable && status == http.StatusOK {
+			s.cache.set(key, s.cache.currentGeneration(), result, ttl)
+		}
+		return jsonResponse(status, result)
 	}
 	generation := s.cache.currentGeneration()
 	if payload, ok := s.cache.get(key, generation); ok {

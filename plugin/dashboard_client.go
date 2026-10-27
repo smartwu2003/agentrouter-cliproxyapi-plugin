@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,16 +52,8 @@ func (c accountClient) hasCredentials() bool {
 	return c.token != "" || c.session != ""
 }
 
-// endpoint builds an absolute dashboard URL.
-func (c accountClient) endpoint(path string, query url.Values) string {
-	target := accountBaseURL(c.cfg) + path
-	if len(query) > 0 {
-		target += "?" + query.Encode()
-	}
-	return target
-}
-
-// accountBaseURL returns the console origin for account/dashboard calls.
+// accountBaseURL returns the configured console origin for account/dashboard
+// calls.
 func accountBaseURL(cfg pluginConfig) string {
 	base := strings.TrimSuffix(strings.TrimSpace(cfg.DashboardBaseURL), "/")
 	if base == "" {
@@ -74,110 +67,148 @@ func controlEndpoint(cfg pluginConfig, path string) string {
 	return accountBaseURL(cfg) + path
 }
 
-// isWAFChallenge reports whether a response is the Aliyun WAF interstitial
-// instead of JSON. The mainland mirror (ps.air-outer.com) serves it for
-// scripted dashboard calls at random; the account client retries the console
-// origin when it sees one.
+// isWAFChallenge reports whether a response is an Aliyun WAF interstitial
+// instead of JSON. Both origins serve it for scripted console calls at random;
+// the client answers by failing over to the other origin.
 func isWAFChallenge(body []byte) bool {
 	return bytes.Contains(body, []byte("aliyun_waf")) || bytes.Contains(body, []byte("<html"))
 }
 
-// do performs one dashboard call and returns the decoded JSON body.
+// consoleCredentials are the optional auth headers of one console call.
+type consoleCredentials struct {
+	Token   string
+	UserID  string
+	Session string
+}
+
+func (c accountClient) credentials() consoleCredentials {
+	return consoleCredentials{Token: c.token, UserID: c.userID, Session: c.session}
+}
+
+// consoleWAFError means the origin answered with the WAF interstitial.
+type consoleWAFError struct {
+	Status int
+	Origin string
+}
+
+func (e *consoleWAFError) Error() string {
+	return fmt.Sprintf("WAF challenge from %s (HTTP %d)", e.Origin, e.Status)
+}
+
+// consoleTransportError wraps a failure that happened before any answer was
+// received, so the alternate origin is worth trying.
+type consoleTransportError struct {
+	Origin string
+	Err    error
+}
+
+func (e *consoleTransportError) Error() string {
+	return fmt.Sprintf("%s unreachable: %v", e.Origin, e.Err)
+}
+
+func (e *consoleTransportError) Unwrap() error { return e.Err }
+
+// retryOnAlternateOrigin reports whether err is caused by one origin rather
+// than by the account itself (a rejected token answers the same everywhere).
+func retryOnAlternateOrigin(err error) bool {
+	var waf *consoleWAFError
+	if errors.As(err, &waf) {
+		return true
+	}
+	var transport *consoleTransportError
+	if errors.As(err, &transport) {
+		return isTransportFailure(transport.Err)
+	}
+	return false
+}
+
+// do performs one dashboard call, moving to the alternate console origin when
+// the current one is blocked or unreachable.
 func (c accountClient) do(ctx context.Context, method, path string, query url.Values, body any) (map[string]any, error) {
 	if !c.hasCredentials() {
 		return nil, errAccountNotAuthorized
 	}
-	var reader io.Reader
-	if body != nil {
-		encoded, errMarshal := json.Marshal(body)
-		if errMarshal != nil {
-			return nil, errMarshal
+	return consoleCall(ctx, c.cfg, c.credentials(), method, path, query, encodedBody(body))
+}
+
+// consoleCall runs one console request with origin failover.
+func consoleCall(ctx context.Context, cfg pluginConfig, creds consoleCredentials, method, path string, query url.Values, body []byte) (map[string]any, error) {
+	primary := accountBaseURL(cfg)
+	tried := make([]string, 0, 2)
+	var lastErr error
+	for _, origin := range consoleOriginMemory.candidates(primary) {
+		payload, errCall := consoleCallAt(ctx, origin, cfg, creds, method, path, query, body, sameOrigin(origin, primary))
+		if errCall == nil {
+			if consoleOriginMemory.remember(origin) {
+				hostLog("info", "agentrouter console origin switched", map[string]any{"origin": origin})
+			}
+			return payload, nil
 		}
-		reader = bytes.NewReader(encoded)
+		lastErr = errCall
+		tried = append(tried, origin)
+		if !retryOnAlternateOrigin(errCall) {
+			// The account itself answered (bad token, quota, ...): trying the
+			// other origin would only ask the same question twice.
+			return payload, errCall
+		}
+		consoleOriginMemory.markFailed(origin)
+		if !sleepContext(ctx, 200*time.Millisecond) {
+			return nil, ctx.Err()
+		}
+	}
+	var waf *consoleWAFError
+	if errors.As(lastErr, &waf) {
+		return nil, fmt.Errorf("AgentRouter 控制台触发了 WAF 风控（HTTP %d，已尝试 %s）。该拦截来自控制台域名而不是推理链路：请在插件设置里配置可用的 proxy_url，并把 dashboard_base_url 设为 https://agentrouter.org（该域名需要代理；国内源站 ps.air-outer.com 始终直连）", waf.Status, strings.Join(tried, " / "))
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("agentrouter console origin is not configured")
+	}
+	return nil, lastErr
+}
+
+// consoleCallAt performs one console request against one origin.
+func consoleCallAt(ctx context.Context, origin string, cfg pluginConfig, creds consoleCredentials, method, path string, query url.Values, body []byte, allowCookie bool) (map[string]any, error) {
+	target := strings.TrimSuffix(origin, "/") + path
+	if len(query) > 0 {
+		target += "?" + query.Encode()
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
-	started := time.Now()
-	request, errRequest := http.NewRequestWithContext(reqCtx, method, c.endpoint(path, query), reader)
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	request, errRequest := http.NewRequestWithContext(reqCtx, method, target, reader)
 	if errRequest != nil {
 		return nil, errRequest
 	}
 	request.Header.Set("Accept", "application/json")
-	request.Header.Set("User-Agent", firstNonEmptyString(c.cfg.UserAgent, defaultUserAgent))
+	request.Header.Set("User-Agent", firstNonEmptyString(cfg.UserAgent, defaultUserAgent))
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	if c.token != "" {
-		request.Header.Set("Authorization", "Bearer "+c.token)
+	if creds.Token != "" {
+		request.Header.Set("Authorization", "Bearer "+creds.Token)
 	}
-	if c.userID != "" {
-		request.Header.Set("New-Api-User", c.userID)
+	if creds.UserID != "" {
+		request.Header.Set("New-Api-User", creds.UserID)
 	}
-	if c.session != "" {
-		request.Header.Set("Cookie", c.session)
+	if allowCookie && creds.Session != "" {
+		// The browser session belongs to the origin that issued it: never send
+		// the cookie to the failover origin.
+		request.Header.Set("Cookie", creds.Session)
 	}
-	response, errDo := controlPlaneClient(c.cfg).Do(request)
+	response, errDo := controlPlaneClientFor(cfg, origin).Do(request)
 	if errDo != nil {
-		return nil, errDo
+		return nil, &consoleTransportError{Origin: origin, Err: errDo}
 	}
 	raw, errRead := io.ReadAll(io.LimitReader(response.Body, 8<<20))
 	response.Body.Close()
-	elapsed := time.Since(started)
 	if errRead != nil {
-		return nil, errRead
+		return nil, &consoleTransportError{Origin: origin, Err: errRead}
 	}
 	if isWAFChallenge(raw) {
-		// The console answered with an Aliyun WAF interstitial. It is triggered
-		// by request bursts and clears after a short cooldown. One short retry
-		// is usually enough; hammering it only deepens the block. The dashboard
-		// aggregation is skipped entirely when the first attempt was already
-		// slow, because a retry would double an already painful page load.
-		retries := []struct {
-			delay time.Duration
-			host  string
-		}{
-			{delay: 400 * time.Millisecond, host: ""},
-		}
-		if path == "/api/data/self" && elapsed > slowFirstAttempt {
-			retries = nil
-		}
-		for _, attempt := range retries {
-			if attempt.delay > 0 {
-				select {
-				case <-reqCtx.Done():
-					return nil, reqCtx.Err()
-				case <-time.After(attempt.delay):
-				}
-			}
-			target := request.URL.String()
-			if attempt.host != "" {
-				target = replaceURLHost(target, attempt.host)
-			}
-			retry, errRetry := http.NewRequestWithContext(reqCtx, method, target, bytes.NewReader(encodedBody(body)))
-			if errRetry != nil {
-				continue
-			}
-			retry.Header = request.Header.Clone()
-			if attempt.host != "" {
-				// Keep any browser-session cookie scoped to the current host only.
-				retry.Header.Del("Cookie")
-			}
-			retried, errDoRetry := controlPlaneClient(c.cfg).Do(retry)
-			if errDoRetry != nil {
-				continue
-			}
-			rawRetry, errReadRetry := io.ReadAll(io.LimitReader(retried.Body, 8<<20))
-			retried.Body.Close()
-			if errReadRetry != nil || isWAFChallenge(rawRetry) {
-				continue
-			}
-			raw = rawRetry
-			response = retried
-			break
-		}
-		if isWAFChallenge(raw) {
-			return nil, fmt.Errorf("AgentRouter 控制台触发了 WAF 风控（HTTP %d），请稍后重试；如长期失败，请在插件设置中配置 proxy_url 并通过 agentrouter.org 访问", response.StatusCode)
-		}
+		return nil, &consoleWAFError{Status: response.StatusCode, Origin: origin}
 	}
 	var payload map[string]any
 	if errUnmarshal := json.Unmarshal(raw, &payload); errUnmarshal != nil {
@@ -191,9 +222,6 @@ func (c accountClient) do(ctx context.Context, method, path string, query url.Va
 		if message == "" {
 			message = fmt.Sprintf("AgentRouter dashboard returned HTTP %d", response.StatusCode)
 		}
-		if success, ok := payload["success"].(bool); ok && !success {
-			return payload, newUpstreamError(response.StatusCode, message)
-		}
 		return payload, newUpstreamError(response.StatusCode, message)
 	}
 	if success, ok := payload["success"].(bool); ok && !success {
@@ -203,32 +231,41 @@ func (c accountClient) do(ctx context.Context, method, path string, query url.Va
 	return payload, nil
 }
 
-// slowFirstAttempt is the latency after which a WAF-blocked dashboard
-// aggregation is not retried: the retry would double an already slow load.
-const slowFirstAttempt = 3 * time.Second
-
-// alternateAccountHost returns the other console origin to try after a WAF block.
-func alternateAccountHost(cfg pluginConfig) string {
-	base := accountBaseURL(cfg)
-	if strings.Contains(base, "agentrouter.org") {
-		return defaultBaseURL
+// consoleJSON reads one public console document (no credentials) into out.
+func consoleJSON(ctx context.Context, cfg pluginConfig, path string, query url.Values, out any) error {
+	var lastErr error
+	for _, origin := range consoleOriginMemory.candidates(accountBaseURL(cfg)) {
+		payload, errCall := consoleCallAt(ctx, origin, cfg, consoleCredentials{}, http.MethodGet, path, query, nil, false)
+		if errCall == nil {
+			consoleOriginMemory.remember(origin)
+			raw, errMarshal := json.Marshal(payload)
+			if errMarshal != nil {
+				return errMarshal
+			}
+			return json.Unmarshal(raw, out)
+		}
+		lastErr = errCall
+		if !retryOnAlternateOrigin(errCall) {
+			return errCall
+		}
+		consoleOriginMemory.markFailed(origin)
 	}
-	return "https://agentrouter.org"
+	return lastErr
 }
 
-// replaceURLHost swaps the scheme+host of an absolute URL.
-func replaceURLHost(raw, host string) string {
-	parsed, errParse := url.Parse(raw)
-	if errParse != nil {
-		return raw
+func sameOrigin(a, b string) bool {
+	return normalizeBaseURL(a) == normalizeBaseURL(b)
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
-	alternate, errAlt := url.Parse(host)
-	if errAlt != nil {
-		return raw
-	}
-	parsed.Scheme = alternate.Scheme
-	parsed.Host = alternate.Host
-	return parsed.String()
 }
 
 // encodedBody re-encodes a request body for a retry.

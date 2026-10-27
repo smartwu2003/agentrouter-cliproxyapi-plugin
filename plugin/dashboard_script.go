@@ -447,6 +447,11 @@ async function loadModels(options) {
   }
 }
 
+function checkinMetric(info) {
+  if (info && info.checked_in) return ['<span class="ok">已签到</span>', info.checked_in_at || ''];
+  if (info && info.checked_in_known === false) return ['<span class="warn">未知</span>', '签到记录暂时读取不到'];
+  return ['<span class="warn">未签到</span>', ''];
+}
 function renderAccount(info, meta) {
   const metrics = $('overviewMetrics');
   const detail = $('overviewAccount');
@@ -460,23 +465,26 @@ function renderAccount(info, meta) {
   }
   state.account = info;
   if (info.success) {
+    const checkin = checkinMetric(info);
     metrics.innerHTML = [
       ['当前余额', fmtUSD(info.quota_usd), info.group ? ('分组 ' + info.group) : ''],
       ['历史消耗', fmtUSD(info.used_usd), ''],
       ['请求次数', String(info.request_count || 0), ''],
-      ['今日签到', info.checked_in ? '<span class="ok">已签到</span>' : '<span class="warn">未签到</span>', info.checked_in_at || '']
+      ['今日签到', checkin[0], checkin[1]]
     ].map(([label, value, sub]) => '<div class="metric"><div class="label">' + label + '</div><div class="value">' + value + '</div><div class="sub">' + esc(sub) + '</div></div>').join('');
   } else {
     metrics.innerHTML = '';
   }
-  detail.innerHTML = staleNote(meta) + [
+  const rows = [
     ['账号', esc(info.display_name || info.username || '-')],
     ['用户 ID', esc(info.user_id || '-')],
     ['分组', esc(info.group || '-')],
     ['可用模型', esc((info.models || []).join(', ') || '-')],
     ['推理密钥', esc(info.api_key_masked || '-')],
     ['授权状态', info.authorized ? '<span class="ok">已授权</span>' : '<span class="err">未授权</span>']
-  ].map(([key, value]) => '<div class="stat"><span class="muted">' + key + '</span><span>' + value + '</span></div>').join('');
+  ];
+  if (info.stale) rows.push(['数据时间', esc(info.stale_at || '缓存') + '（控制台不可达，已显示缓存）']);
+  detail.innerHTML = staleNote(meta) + rows.map(([key, value]) => '<div class="stat"><span class="muted">' + key + '</span><span>' + value + '</span></div>').join('');
   if (info.message) detail.innerHTML += '<div class="banner warn">' + esc(info.message) + '</div>';
   if (meta && meta.error) {
     detail.innerHTML += '<div class="banner error">' + esc(describeError(meta.error))
@@ -528,12 +536,20 @@ async function queryAccount(options) {
 
 function checkinRows(payload, optimistic) {
   const rows = [];
-  const checked = optimistic ? true : payload.checked_in;
-  rows.push(['今日签到', checked ? (optimistic && !payload.checked_in ? '<span class="warn">签到中…</span>' : '<span class="ok">已签到</span>') : '<span class="warn">未签到</span>' + (payload.checked_in_at ? ' · ' + esc(payload.checked_in_at) : '')]);
+  const known = payload.checked_in_known !== false;
+  const checked = optimistic ? true : !!payload.checked_in;
+  const when = payload.checked_in_at ? esc(payload.checked_in_at) : '';
+  let today;
+  if (optimistic && !payload.checked_in) today = '<span class="warn">签到中…</span>';
+  else if (checked) today = '<span class="ok">已签到</span>' + (when ? ' <span class="muted">' + when + '</span>' : '');
+  else if (!known) today = '<span class="warn">未知</span> <span class="muted">签到记录暂时读取不到</span>';
+  else today = '<span class="warn">未签到</span>';
+  if (checked && payload.reward_usd) today += ' <span class="muted">奖励 ' + fmtUSD(payload.reward_usd) + '</span>';
+  rows.push(['今日签到', today]);
   if (payload.last_checkin) {
     rows.push(['最近签到', esc(payload.last_checkin.checked_in_at || '') + (payload.last_checkin.quota_awarded ? ' · 奖励 ' + fmtUSD(payload.last_checkin.quota_awarded) : '')]);
   }
-  if (payload.server_error) rows.push(['服务端', '<span class="warn">' + esc(payload.server_error) + '</span>']);
+  if (payload.server_error && !checked) rows.push(['服务端', '<span class="warn">' + esc(payload.server_error) + '</span>']);
   return rows;
 }
 function renderCheckinStatus(payload, meta, optimistic) {
@@ -715,6 +731,17 @@ async function loadDashboard(options) {
 }
 
 let logsRequestSeq = 0;
+function logTypeClass(type) {
+  if (type === 5) return 'err';
+  if (type === 4) return 'ok';
+  if (type === 2) return 'spend';
+  if (type === 1) return 'recharge';
+  return '';
+}
+function logDetailText(item) {
+  const text = String(item.content || '').trim();
+  return text || '-';
+}
 function renderLogs(payload, meta) {
   const box = $('logsBox');
   if (!box) return;
@@ -726,13 +753,21 @@ function renderLogs(payload, meta) {
   state.logsPage = payload.page ? payload.page - 1 : 0;
   state.logsTotal = payload.total || 0;
   $('logsMeta').textContent = '共 ' + state.logsTotal + ' 条 · 第 ' + (state.logsPage + 1) + ' 页' + (meta && meta.stale ? ' · 更新于 ' + agoText(meta.entry.ts) + ' 前' : '');
-  box.innerHTML = (payload.items || []).length ? '<table><thead><tr><th>时间</th><th>模型</th><th>类型</th><th>Tokens</th><th>消费</th><th>详情</th></tr></thead><tbody>'
-    + payload.items.map(item =>
-      '<tr><td class="muted">' + esc(item.created_at_text) + '</td><td>' + esc(item.model_name || '-') + '</td>'
-      + '<td><span class="pill ' + (item.type === 5 ? 'err' : item.type === 4 ? 'ok' : '') + '">' + esc(item.type_label) + '</span></td>'
-      + '<td class="muted">' + fmtNum((item.prompt_tokens || 0) + (item.completion_tokens || 0)) + '</td>'
-      + '<td>' + fmtUSD(item.quota_usd) + '</td><td class="muted">' + esc(item.content || '') + '</td></tr>'
-    ).join('') + '</tbody></table>' : '<div class="empty">没有匹配的日志</div>';
+  const rows = (payload.items || []).map(item => {
+    const tokens = (item.prompt_tokens || 0) + (item.completion_tokens || 0);
+    const detail = logDetailText(item);
+    const model = item.model_name || '-';
+    const cost = Number(item.quota_usd || 0);
+    return '<tr>'
+      + '<td class="log-time">' + esc(item.created_at_text) + '</td>'
+      + '<td class="log-model"><span title="' + esc(model) + '">' + esc(model) + '</span></td>'
+      + '<td class="log-type"><span class="pill ' + logTypeClass(item.type) + '">' + esc(item.type_label) + '</span></td>'
+      + '<td class="log-num">' + esc(fmtNum(tokens)) + '</td>'
+      + '<td class="log-cost' + (cost > 0 ? '' : ' zero') + '">' + esc(fmtUSD(cost)) + '</td>'
+      + '<td class="log-detail"><span title="' + esc(detail) + '">' + esc(detail) + '</span></td>'
+      + '</tr>';
+  }).join('');
+  box.innerHTML = rows ? '<table class="logs-table"><thead><tr><th>时间</th><th>模型</th><th>类型</th><th class="right">Tokens</th><th class="right">消费</th><th>详情</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<div class="empty">没有匹配的日志</div>';
   box.dataset.loaded = '1';
   if (meta && meta.error) inlineError(box, meta.error, () => loadLogs(state.logsPage, true));
 }

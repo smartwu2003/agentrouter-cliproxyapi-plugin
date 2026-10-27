@@ -129,48 +129,83 @@ type streamedResponse struct {
 	Body       io.ReadCloser
 }
 
-// runUpstream translates and sends one request to AgentRouter.
-func runUpstream(ctx context.Context, cfg pluginConfig, req pluginapi.ExecutorRequest, stream bool) (*streamedResponse, error) {
-	protocol := protocolForRequest(cfg, req.Model, req.SourceFormat)
-	endpoint, payload, errBuild := buildUpstreamRequest(protocol, cfg, req)
-	if errBuild != nil {
-		return nil, errBuild
-	}
-	url := strings.TrimSuffix(cfg.BaseURL, "/") + endpoint
-	httpReq, errNew := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-	if errNew != nil {
-		return nil, fmt.Errorf("build agentrouter request: %w", errNew)
-	}
-	applyUpstreamHeaders(httpReq, cfg, protocol, req, stream)
-	client := upstreamClient{host: req.HTTPClient}
-	var resp *http.Response
-	var errDo error
-	if stream {
-		resp, errDo = client.doStream(httpReq)
-	} else {
-		resp, errDo = client.do(httpReq)
-	}
-	if errDo != nil {
-		return nil, fmt.Errorf("agentrouter request failed: %w", errDo)
-	}
-	return &streamedResponse{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: resp.Body}, nil
+// upstreamAttempt is one way to reach AgentRouter: an origin plus the transport
+// that origin needs. The same account answers on both origins, but the mainland
+// one must not be proxied while the global one must be.
+type upstreamAttempt struct {
+	origin   string
+	viaProxy bool
+	client   *http.Client
+	host     pluginapi.HostHTTPClient
 }
 
-// upstreamClient adapts the host HTTP client (so request logs capture the
-// traffic) or a plain client when the host did not provide one.
-type upstreamClient struct {
-	host pluginapi.HostHTTPClient
+// planUpstreamAttempts orders the origins for one request: the one that last
+// worked, then the configured origin, then the alternate origin. A proxied-only
+// origin (agentrouter.org) uses the plugin's proxied client when proxy_url is
+// set; everything else keeps using the host client so CPA's request log and
+// proxy policy stay authoritative.
+func planUpstreamAttempts(cfg pluginConfig, host pluginapi.HostHTTPClient) []upstreamAttempt {
+	origins := inferenceOriginMemory.candidates(cfg.BaseURL)
+	attempts := make([]upstreamAttempt, 0, len(origins))
+	for _, origin := range origins {
+		attempt := upstreamAttempt{origin: origin}
+		switch proxy := proxyForOrigin(cfg, origin); {
+		case proxy != "":
+			attempt.viaProxy = true
+			attempt.client = originHTTPClient(cfg, origin, 0)
+		case host != nil:
+			attempt.host = host
+		default:
+			attempt.client = originHTTPClient(cfg, origin, 0)
+		}
+		attempts = append(attempts, attempt)
+	}
+	return attempts
 }
 
-func (c upstreamClient) do(req *http.Request) (*http.Response, error) {
-	if c.host == nil {
-		return fallbackHTTPClient.Do(req)
+// send performs the request through the attempt's transport.
+func (a upstreamAttempt) send(req *http.Request, stream bool) (*http.Response, error) {
+	if a.host == nil {
+		return a.client.Do(req)
 	}
 	body, errRead := readRequestBody(req)
 	if errRead != nil {
 		return nil, errRead
 	}
-	resp, errDo := c.host.Do(req.Context(), pluginapi.HTTPRequest{
+	if stream {
+		resp, errDo := a.host.DoStream(req.Context(), pluginapi.HTTPRequest{
+			Method:  req.Method,
+			URL:     req.URL.String(),
+			Headers: req.Header.Clone(),
+			Body:    body,
+		})
+		if errDo != nil {
+			return nil, errDo
+		}
+		pr, pw := io.Pipe()
+		go func() {
+			defer pw.Close()
+			for chunk := range resp.Chunks {
+				if chunk.Err != nil {
+					_ = pw.CloseWithError(chunk.Err)
+					return
+				}
+				if len(chunk.Payload) == 0 {
+					continue
+				}
+				if _, errWrite := pw.Write(chunk.Payload); errWrite != nil {
+					return
+				}
+			}
+		}()
+		return &http.Response{
+			StatusCode: resp.StatusCode,
+			Header:     resp.Headers,
+			Body:       pr,
+			Request:    req,
+		}, nil
+	}
+	resp, errDo := a.host.Do(req.Context(), pluginapi.HTTPRequest{
 		Method:  req.Method,
 		URL:     req.URL.String(),
 		Headers: req.Header.Clone(),
@@ -187,45 +222,59 @@ func (c upstreamClient) do(req *http.Request) (*http.Response, error) {
 	}, nil
 }
 
-func (c upstreamClient) doStream(req *http.Request) (*http.Response, error) {
-	if c.host == nil {
-		return fallbackHTTPClient.Do(req)
+// runUpstream translates and sends one request to AgentRouter, moving to the
+// alternate origin when the first one is unreachable. Only transport failures
+// fail over: an HTTP answer (even a 5xx) is handed back untouched so retries
+// stay visible and are never silently duplicated.
+func runUpstream(ctx context.Context, cfg pluginConfig, req pluginapi.ExecutorRequest, stream bool) (*streamedResponse, error) {
+	protocol := protocolForRequest(cfg, req.Model, req.SourceFormat)
+	endpoint, payload, errBuild := buildUpstreamRequest(protocol, cfg, req)
+	if errBuild != nil {
+		return nil, errBuild
 	}
-	body, errRead := readRequestBody(req)
-	if errRead != nil {
-		return nil, errRead
-	}
-	resp, errDo := c.host.DoStream(req.Context(), pluginapi.HTTPRequest{
-		Method:  req.Method,
-		URL:     req.URL.String(),
-		Headers: req.Header.Clone(),
-		Body:    body,
-	})
-	if errDo != nil {
-		return nil, errDo
-	}
-	pr, pw := io.Pipe()
-	go func() {
-		defer pw.Close()
-		for chunk := range resp.Chunks {
-			if chunk.Err != nil {
-				_ = pw.CloseWithError(chunk.Err)
-				return
+	attempts := planUpstreamAttempts(cfg, req.HTTPClient)
+	var lastErr error
+	for index, attempt := range attempts {
+		if errContext := ctx.Err(); errContext != nil {
+			return nil, errContext
+		}
+		httpReq, errNew := http.NewRequestWithContext(ctx, http.MethodPost, attempt.origin+endpoint, bytes.NewReader(payload))
+		if errNew != nil {
+			return nil, fmt.Errorf("build agentrouter request: %w", errNew)
+		}
+		applyUpstreamHeaders(httpReq, cfg, protocol, req, stream)
+		resp, errDo := attempt.send(httpReq, stream)
+		if errDo != nil {
+			if errContext := ctx.Err(); errContext != nil {
+				return nil, errContext
 			}
-			if len(chunk.Payload) == 0 {
+			lastErr = errDo
+			if !isTransportFailure(errDo) {
+				return nil, fmt.Errorf("agentrouter request failed: %w", errDo)
+			}
+			inferenceOriginMemory.markFailed(attempt.origin)
+			if index < len(attempts)-1 {
+				hostLog("warn", "agentrouter origin unreachable", map[string]any{
+					"origin":   attempt.origin,
+					"error":    errDo.Error(),
+					"fallback": attempts[index+1].origin,
+				})
 				continue
 			}
-			if _, errWrite := pw.Write(chunk.Payload); errWrite != nil {
-				return
-			}
+			return nil, fmt.Errorf("agentrouter request failed: %w", errDo)
 		}
-	}()
-	return &http.Response{
-		StatusCode: resp.StatusCode,
-		Header:     resp.Headers,
-		Body:       pr,
-		Request:    req,
-	}, nil
+		if inferenceOriginMemory.remember(attempt.origin) {
+			hostLog("info", "agentrouter inference origin selected", map[string]any{
+				"origin": attempt.origin,
+				"proxy":  attempt.viaProxy,
+			})
+		}
+		return &streamedResponse{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: resp.Body}, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no agentrouter origin available")
+	}
+	return nil, fmt.Errorf("agentrouter request failed: %w", lastErr)
 }
 
 func readRequestBody(req *http.Request) ([]byte, error) {
@@ -239,8 +288,6 @@ func readRequestBody(req *http.Request) ([]byte, error) {
 	req.Body = io.NopCloser(bytes.NewReader(body))
 	return body, nil
 }
-
-var fallbackHTTPClient = &http.Client{Transport: http.DefaultTransport}
 
 // buildUpstreamRequest converts the canonical request into the wire format
 // AgentRouter expects for the chosen protocol.

@@ -1,65 +1,18 @@
 package main
 
 import (
-	"context"
-	"net"
 	"net/http"
-	"net/url"
-	"strings"
-	"sync"
 	"time"
 )
 
-// controlPlaneClient returns an HTTP client for AgentRouter management calls
-// (model catalogue, account details, check-in). Inference never uses it: that
-// traffic goes through the host HTTP client so request logs and proxy policy
-// stay consistent.
+// controlPlaneClient returns the client for the configured console origin.
+// Call sites that already know the origin use controlPlaneClientFor so the
+// proxy decision follows the origin (proxied origins use proxy_url, the
+// mainland origin always connects directly).
 func controlPlaneClient(cfg pluginConfig) *http.Client {
-	proxyURL := strings.TrimSpace(cfg.ProxyURL)
-	key := "direct"
-	if proxyURL != "" {
-		key = proxyURL
-	}
-	controlPlaneClients.mu.Lock()
-	defer controlPlaneClients.mu.Unlock()
-	if client, ok := controlPlaneClients.byKey[key]; ok {
-		return client
-	}
-	dialer := &net.Dialer{
-		Timeout:   20 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-	transport := &http.Transport{
-		Proxy: nil,
-		// Prefer IPv4: the console origin publishes an AAAA record that some
-		// mainland networks cannot reach, and Go would otherwise stall on it.
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, errDial := dialer.DialContext(ctx, "tcp4", addr)
-			if errDial == nil {
-				return conn, nil
-			}
-			return dialer.DialContext(ctx, network, addr)
-		},
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          16,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   15 * time.Second,
-		ExpectContinueTimeout: time.Second,
-	}
-	if proxyURL != "" {
-		if parsed, errParse := url.Parse(proxyURL); errParse == nil && parsed.Host != "" {
-			transport.Proxy = http.ProxyURL(parsed)
-		}
-	}
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   60 * time.Second,
-	}
-	controlPlaneClients.byKey[key] = client
-	return client
+	return controlPlaneClientFor(cfg, accountBaseURL(cfg))
 }
 
-var controlPlaneClients = struct {
-	mu    sync.Mutex
-	byKey map[string]*http.Client
-}{byKey: map[string]*http.Client{}}
+func controlPlaneClientFor(cfg pluginConfig, origin string) *http.Client {
+	return originHTTPClient(cfg, origin, 60*time.Second)
+}

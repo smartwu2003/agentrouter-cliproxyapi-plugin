@@ -156,7 +156,7 @@ func fetchLoginToken(ctx context.Context, cfg pluginConfig, session dashboardSes
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	request, errRequest := http.NewRequestWithContext(requestCtx, http.MethodGet, strings.TrimSuffix(cfg.BaseURL, "/")+"/api/user/token", nil)
+	request, errRequest := http.NewRequestWithContext(requestCtx, http.MethodGet, controlEndpoint(cfg, "/api/user/token"), nil)
 	if errRequest != nil {
 		return "", errRequest
 	}
@@ -345,8 +345,8 @@ func performCheckin(ctx context.Context, cfg pluginConfig) (checkinResult, error
 		result.QuotaAwarded = result.QuotaAfter - beforeQuota
 	}
 	result.Success = true
-	result.CheckinDate = time.Now().Format("2006-01-02")
-	result.CheckedInAt = time.Now().Format("2006-01-02 15:04:05")
+	result.CheckinDate = beijingToday(time.Now())
+	result.CheckedInAt = beijingNowText()
 	if login.Checked {
 		result.Message = "签到成功，奖励已到账"
 		if result.QuotaAwarded > 0 {
@@ -369,6 +369,10 @@ func performCheckin(ctx context.Context, cfg pluginConfig) (checkinResult, error
 			CheckedInAt:  result.CheckedInAt,
 		}
 	})
+	// Refresh the authoritative status from the reward log, so the card shows the
+	// reward even when the login payload omitted checked_in.
+	invalidateDailyCheckin()
+	resolveDailyCheckin(ctx, cfg, newAccountClient(cfg), true)
 	return result, nil
 }
 
@@ -401,9 +405,17 @@ func mergeAccount(existing *storedAccount, login loginResult, cfg pluginConfig) 
 	if login.Session.cookie != "" {
 		account.Session = login.Session.cookie
 	}
+	day := beijingToday(time.Now())
 	if login.Checked {
 		account.CheckedIn = true
-		account.CheckedInAt = time.Now().Format("2006-01-02 15:04:05")
+		account.CheckedInAt = beijingNowText()
+		account.CheckedInDate = day
+	} else if !account.checkedInOn(day) {
+		// A new day starts unchecked. Keeping yesterday's flag is what made the
+		// card claim a stale "already checked in" for weeks.
+		account.CheckedIn = false
+		account.CheckedInAt = ""
+		account.CheckedInDate = ""
 	}
 	account.LoginAt = unixNow()
 	return account
@@ -420,37 +432,109 @@ func sessionQuota(ctx context.Context, cfg pluginConfig, session dashboardSessio
 
 // accountInfo is the shape returned to the dashboard account card.
 type accountInfo struct {
-	Success      bool           `json:"success"`
-	Username     string         `json:"username,omitempty"`
-	DisplayName  string         `json:"display_name,omitempty"`
-	Email        string         `json:"email,omitempty"`
-	Group        string         `json:"group,omitempty"`
-	QuotaUSD     float64        `json:"quota_usd"`
-	UsedUSD      float64        `json:"used_usd"`
-	RequestCount int64          `json:"request_count"`
-	UserID       string         `json:"user_id,omitempty"`
-	Models       []string       `json:"models,omitempty"`
-	Groups       map[string]any `json:"groups,omitempty"`
-	CheckedIn    bool           `json:"checked_in"`
-	CheckedInAt  string         `json:"checked_in_at,omitempty"`
-	Authorized   bool           `json:"authorized"`
-	APIKeyMasked string         `json:"api_key_masked,omitempty"`
-	Message      string         `json:"message,omitempty"`
-	LastCheckin  any            `json:"last_checkin,omitempty"`
+	Success        bool           `json:"success"`
+	Username       string         `json:"username,omitempty"`
+	DisplayName    string         `json:"display_name,omitempty"`
+	Email          string         `json:"email,omitempty"`
+	Group          string         `json:"group,omitempty"`
+	QuotaUSD       float64        `json:"quota_usd"`
+	UsedUSD        float64        `json:"used_usd"`
+	RequestCount   int64          `json:"request_count"`
+	UserID         string         `json:"user_id,omitempty"`
+	Models         []string       `json:"models,omitempty"`
+	Groups         map[string]any `json:"groups,omitempty"`
+	CheckedIn      bool           `json:"checked_in"`
+	CheckedInAt    string         `json:"checked_in_at,omitempty"`
+	CheckedInDate  string         `json:"checked_in_date,omitempty"`
+	CheckedInKnown bool           `json:"checked_in_known"`
+	CheckinSource  string         `json:"checkin_source,omitempty"`
+	Authorized     bool           `json:"authorized"`
+	APIKeyMasked   string         `json:"api_key_masked,omitempty"`
+	Message        string         `json:"message,omitempty"`
+	LastCheckin    any            `json:"last_checkin,omitempty"`
+	// Stale marks values restored from the last successful console read.
+	Stale   bool   `json:"stale,omitempty"`
+	StaleAt string `json:"stale_at,omitempty"`
+	// ConsoleOrigin is the console origin that answered (empty when all failed).
+	ConsoleOrigin string `json:"console_origin,omitempty"`
+}
+
+// newAccountInfo always exposes the configured inference key. The masked key is
+// a configuration fact, not a console read: it must not disappear when the
+// console is blocked, which is what made the old card show "-" for 推理密钥.
+func newAccountInfo(cfg pluginConfig) accountInfo {
+	return accountInfo{
+		APIKeyMasked:  maskSecret(cfg.APIKey),
+		ConsoleOrigin: consoleOriginMemory.get(),
+	}
+}
+
+// hydrateAccountFromCache fills the card with the last successful console read
+// when the console cannot be reached, so a WAF block no longer blanks every
+// field.
+func hydrateAccountFromCache(info *accountInfo) {
+	state := cachedState()
+	if state.Account == nil {
+		return
+	}
+	account := state.Account
+	filled := false
+	set := func(target *string, value string) {
+		if strings.TrimSpace(*target) == "" && strings.TrimSpace(value) != "" {
+			*target = value
+			filled = true
+		}
+	}
+	set(&info.Username, account.Username)
+	set(&info.DisplayName, account.DisplayName)
+	set(&info.Email, account.Email)
+	set(&info.Group, account.Group)
+	set(&info.UserID, account.UserID)
+	if info.QuotaUSD == 0 && account.Quota > 0 {
+		info.QuotaUSD = quotaToUSD(float64(account.Quota))
+		filled = true
+	}
+	if info.UsedUSD == 0 && account.UsedQuota > 0 {
+		info.UsedUSD = quotaToUSD(float64(account.UsedQuota))
+		filled = true
+	}
+	if info.RequestCount == 0 && account.RequestCount > 0 {
+		info.RequestCount = account.RequestCount
+		filled = true
+	}
+	if !filled {
+		return
+	}
+	info.Stale = true
+	if account.LoginAt > 0 {
+		info.StaleAt = time.Unix(account.LoginAt, 0).Format("2006-01-02 15:04")
+	} else {
+		info.StaleAt = "上次成功读取"
+	}
+}
+
+// consoleUnavailableMessage explains a console failure without implying the
+// inference key is missing.
+func consoleUnavailableMessage(info accountInfo, err error) string {
+	if err == nil {
+		return ""
+	}
+	if info.Stale {
+		return "控制台暂时不可达，已显示 " + info.StaleAt + " 的缓存数据：" + err.Error()
+	}
+	return "控制台暂时不可达（推理不受影响）：" + err.Error()
 }
 
 // fetchAccountInfo reads the account overview through the dashboard API.
 func fetchAccountInfo(ctx context.Context, cfg pluginConfig) (accountInfo, error) {
 	client := newAccountClient(cfg)
-	info := accountInfo{}
+	info := newAccountInfo(cfg)
 	if models, errModels := fetchAPIKeyModels(ctx, cfg); errModels == nil {
 		for _, model := range models {
 			info.Models = append(info.Models, model.ID)
 		}
 	}
 	if state := cachedState(); state.Account != nil {
-		info.CheckedIn = state.Account.CheckedIn
-		info.CheckedInAt = state.Account.CheckedInAt
 		info.LastCheckin = state.LastCheckin
 	}
 	if !client.hasCredentials() && hasAccountCredentials(cfg) {
@@ -458,6 +542,7 @@ func fetchAccountInfo(ctx context.Context, cfg pluginConfig) (accountInfo, error
 		flow, errAuth := authorizeAccount(ctx, cfg)
 		if errAuth != nil {
 			info.Message = errAuth.Error()
+			hydrateAccountFromCache(&info)
 			return info, nil
 		}
 		applyFlowToState(cfg, flow)
@@ -465,12 +550,16 @@ func fetchAccountInfo(ctx context.Context, cfg pluginConfig) (accountInfo, error
 	}
 	if !client.hasCredentials() {
 		info.Message = "账号尚未授权：点击「账号授权」登录 AgentRouter，或在配置中填写 account_token 与 user_id"
+		applyPersistedDailyCheckin(&info)
+		hydrateAccountFromCache(&info)
 		return info, nil
 	}
 	info.Authorized = true
 	user, errSelf := client.fetchSelf(ctx)
 	if errSelf != nil {
-		info.Message = errSelf.Error()
+		applyPersistedDailyCheckin(&info)
+		hydrateAccountFromCache(&info)
+		info.Message = consoleUnavailableMessage(info, errSelf)
 		return info, nil
 	}
 	info.Success = true
@@ -482,13 +571,16 @@ func fetchAccountInfo(ctx context.Context, cfg pluginConfig) (accountInfo, error
 	info.QuotaUSD = quotaToUSD(user.Quota)
 	info.UsedUSD = quotaToUSD(user.UsedQuota)
 	info.RequestCount = user.RequestCount
+	info.ConsoleOrigin = consoleOriginMemory.get()
+	// The profile payload has no check-in flag. Derive today's status from the
+	// reward log so a check-in performed on the website is reflected here.
+	applyDailyCheckin(&info, resolveDailyCheckin(ctx, cfg, client, false))
 	if client.token == "" {
-		info.Message = "当前只有浏览器会话凭据，部分接口（令牌管理、签到）可能不可用；建议重新执行账号授权以获取访问令牌"
+		info.Message = "当前只有浏览器会话凭据，部分接口（令牌管理）可能不可用；建议重新执行账号授权以获取访问令牌"
 	}
 	if groups, errGroups := client.fetchGroups(ctx); errGroups == nil {
 		info.Groups = groups
 	}
-	info.APIKeyMasked = maskSecret(cfg.APIKey)
 	return info, nil
 }
 
@@ -529,9 +621,15 @@ func applyFlowToState(cfg pluginConfig, flow flowResult) {
 			}
 		}
 		account.LoginAt = unixNow()
+		day := beijingToday(time.Now())
 		if flow.CheckedIn {
 			account.CheckedIn = true
-			account.CheckedInAt = time.Now().Format("2006-01-02 15:04:05")
+			account.CheckedInAt = beijingNowText()
+			account.CheckedInDate = day
+		} else if !account.checkedInOn(day) {
+			account.CheckedIn = false
+			account.CheckedInAt = ""
+			account.CheckedInDate = ""
 		}
 		state.Account = account
 		if state.APIKeyName == "" {

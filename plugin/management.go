@@ -172,6 +172,8 @@ func settingsResponse() pluginapi.ManagementResponse {
 		"user_agent":           cfg.UserAgent,
 		"proxy_url":            cfg.ProxyURL,
 		"dashboard_base_url":   cfg.DashboardBaseURL,
+		"inference_origin":     inferenceOriginMemory.get(),
+		"console_origin":       consoleOriginMemory.get(),
 		"auto_discover_models": autoDiscoverModels(cfg),
 		"has_api_key":          strings.TrimSpace(cfg.APIKey) != "",
 		"api_key_masked":       maskSecret(cfg.APIKey),
@@ -262,6 +264,14 @@ func saveSettingsResponse(req pluginapi.ManagementRequest) pluginapi.ManagementR
 	activeConfigMu.Lock()
 	activeConfig = merged
 	activeConfigMu.Unlock()
+	// A changed origin invalidates the sticky choice, exactly like a YAML reload.
+	if normalizeBaseURL(cfg.BaseURL) != normalizeBaseURL(merged.BaseURL) {
+		inferenceOriginMemory.reset()
+	}
+	if normalizeBaseURL(cfg.DashboardBaseURL) != normalizeBaseURL(merged.DashboardBaseURL) ||
+		strings.TrimSpace(cfg.ProxyURL) != strings.TrimSpace(merged.ProxyURL) {
+		consoleOriginMemory.reset()
+	}
 	primeCatalogue(merged)
 	invalidateManagementCache()
 	return jsonResponse(http.StatusOK, map[string]any{
@@ -319,7 +329,7 @@ func accountResponse(req pluginapi.ManagementRequest) pluginapi.ManagementRespon
 // identical to fetchAccountInfo.
 func fetchAccountInfoParallel(ctx context.Context, cfg pluginConfig) (accountInfo, error) {
 	client := newAccountClient(cfg)
-	info := accountInfo{}
+	info := newAccountInfo(cfg)
 	if !client.hasCredentials() && hasAccountCredentials(cfg) {
 		// No durable token yet: sign in once to obtain one. This must finish
 		// before the dashboard calls can carry credentials.
@@ -333,8 +343,6 @@ func fetchAccountInfoParallel(ctx context.Context, cfg pluginConfig) (accountInf
 		client = newAccountClient(effectiveConfig())
 	}
 	if state := cachedState(); state.Account != nil {
-		info.CheckedIn = state.Account.CheckedIn
-		info.CheckedInAt = state.Account.CheckedInAt
 		info.LastCheckin = state.LastCheckin
 	}
 	if !client.hasCredentials() {
@@ -346,6 +354,8 @@ func fetchAccountInfoParallel(ctx context.Context, cfg pluginConfig) (accountInf
 			}
 		}
 		info.Message = "账号尚未授权：点击「账号授权」登录 AgentRouter，或在配置中填写 account_token 与 user_id"
+		applyPersistedDailyCheckin(&info)
+		hydrateAccountFromCache(&info)
 		return info, nil
 	}
 	info.Authorized = true
@@ -380,7 +390,9 @@ func fetchAccountInfoParallel(ctx context.Context, cfg pluginConfig) (accountInf
 		}
 	}
 	if errSelf != nil {
-		info.Message = errSelf.Error()
+		applyPersistedDailyCheckin(&info)
+		hydrateAccountFromCache(&info)
+		info.Message = consoleUnavailableMessage(info, errSelf)
 		return info, nil
 	}
 	info.Success = true
@@ -393,12 +405,15 @@ func fetchAccountInfoParallel(ctx context.Context, cfg pluginConfig) (accountInf
 	info.UsedUSD = quotaToUSD(user.UsedQuota)
 	info.RequestCount = user.RequestCount
 	if client.token == "" {
-		info.Message = "当前只有浏览器会话凭据，部分接口（令牌管理、签到）可能不可用；建议重新执行账号授权以获取访问令牌"
+		info.Message = "当前只有浏览器会话凭据，部分接口（令牌管理）可能不可用；建议重新执行账号授权以获取访问令牌"
 	}
 	if errGroups == nil {
 		info.Groups = groups
 	}
-	info.APIKeyMasked = maskSecret(cfg.APIKey)
+	info.ConsoleOrigin = consoleOriginMemory.get()
+	// The profile payload has no check-in flag; read today's reward log so a
+	// check-in done on the website is reflected without another login.
+	applyDailyCheckin(&info, resolveDailyCheckin(ctx, cfg, client, false))
 	return info, nil
 }
 
@@ -419,31 +434,30 @@ func checkinResponse(req pluginapi.ManagementRequest) pluginapi.ManagementRespon
 	return jsonResponse(http.StatusOK, map[string]any{"success": true, "result": result})
 }
 
+// checkinStatusResponse reports today's check-in state. AgentRouter redeems the
+// reward inside the console login flow and does not implement the generic
+// /api/user/self/checkin endpoint, so the authoritative source is the "签到"
+// entry of today's usage log, resolved in Beijing time.
 func checkinStatusResponse(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	cfg := mergeOverrides(effectiveConfig(), req.Body)
 	client := newAccountClient(cfg)
 	state := cachedState()
+	status := resolveDailyCheckin(context.Background(), cfg, client, refreshRequested(req))
 	payload := map[string]any{
-		"success":       true,
-		"last_checkin":  state.LastCheckin,
-		"has_account":   client.hasCredentials(),
-		"checked_in":    state.Account != nil && state.Account.CheckedIn,
-		"checked_in_at": "",
+		"success":          true,
+		"last_checkin":     state.LastCheckin,
+		"has_account":      client.hasCredentials(),
+		"checked_in":       status.CheckedIn,
+		"checked_in_known": status.Known,
+		"checked_in_at":    status.CheckedInAt,
+		"checked_in_date":  status.Date,
+		"checkin_source":   status.Source,
 	}
-	if state.Account != nil {
-		payload["checked_in_at"] = state.Account.CheckedInAt
+	if status.RewardUSD > 0 {
+		payload["reward_usd"] = status.RewardUSD
 	}
-	month := strings.TrimSpace(req.Query.Get("month"))
-	if client.hasCredentials() {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		if data, errStatus := client.fetchCheckinStatus(ctx, month); errStatus == nil {
-			payload["server"] = data
-		} else if !strings.Contains(errStatus.Error(), "Invalid URL") {
-			// AgentRouter redeems the daily reward inside the login flow and
-			// does not expose the newer New API check-in endpoint.
-			payload["server_error"] = errStatus.Error()
-		}
+	if status.Message != "" {
+		payload["server_error"] = status.Message
 	}
 	return jsonResponse(http.StatusOK, payload)
 }
@@ -912,7 +926,6 @@ func probeModel(ctx context.Context, cfg pluginConfig, model, protocol string) (
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	base := strings.TrimSuffix(cfg.BaseURL, "/")
 	var endpoint string
 	var payload []byte
 	switch protocol {
@@ -926,29 +939,42 @@ func probeModel(ctx context.Context, cfg pluginConfig, model, protocol string) (
 		endpoint = "/v1/chat/completions"
 		payload = []byte(fmt.Sprintf(`{"model":%q,"max_tokens":32,"messages":[{"role":"user","content":"Reply with OK only"}],"stream":false}`, model))
 	}
-	request, errRequest := http.NewRequestWithContext(requestCtx, http.MethodPost, base+endpoint, bytes.NewReader(payload))
-	if errRequest != nil {
-		return nil, 0, errRequest
+	var lastErr error
+	for _, attempt := range planUpstreamAttempts(cfg, nil) {
+		request, errRequest := http.NewRequestWithContext(requestCtx, http.MethodPost, attempt.origin+endpoint, bytes.NewReader(payload))
+		if errRequest != nil {
+			return nil, 0, errRequest
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("User-Agent", cfg.UserAgent)
+		if protocol == protocolAnthropic {
+			request.Header.Set("x-api-key", cfg.APIKey)
+			request.Header.Set("anthropic-version", "2023-06-01")
+		} else {
+			request.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+		}
+		response, errDo := attempt.send(request, false)
+		if errDo != nil {
+			lastErr = errDo
+			if !isTransportFailure(errDo) {
+				return nil, 0, errDo
+			}
+			inferenceOriginMemory.markFailed(attempt.origin)
+			continue
+		}
+		responseBody, errRead := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+		response.Body.Close()
+		if errRead != nil {
+			return nil, response.StatusCode, errRead
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return responseBody, response.StatusCode, newUpstreamError(response.StatusCode, summarizeUpstreamError(responseBody))
+		}
+		inferenceOriginMemory.remember(attempt.origin)
+		return responseBody, response.StatusCode, nil
 	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("User-Agent", cfg.UserAgent)
-	if protocol == protocolAnthropic {
-		request.Header.Set("x-api-key", cfg.APIKey)
-		request.Header.Set("anthropic-version", "2023-06-01")
-	} else {
-		request.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no agentrouter origin available")
 	}
-	response, errDo := controlPlaneClient(cfg).Do(request)
-	if errDo != nil {
-		return nil, 0, errDo
-	}
-	defer response.Body.Close()
-	responseBody, errRead := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-	if errRead != nil {
-		return nil, response.StatusCode, errRead
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return responseBody, response.StatusCode, newUpstreamError(response.StatusCode, summarizeUpstreamError(responseBody))
-	}
-	return responseBody, response.StatusCode, nil
+	return nil, 0, lastErr
 }

@@ -405,10 +405,35 @@ func appendUniqueProtocol(protocols []string, protocol string) []string {
 	return append(protocols, protocol)
 }
 
+// fetchAPIKeyModels reads the models the API key can use. Discovery follows the
+// same origin rule as inference: the configured origin first, then the
+// alternate origin when the first one is unreachable.
 func fetchAPIKeyModels(ctx context.Context, cfg pluginConfig) ([]pluginapi.ModelInfo, error) {
+	var lastErr error
+	for _, origin := range inferenceOriginMemory.candidates(cfg.BaseURL) {
+		models, errFetch := fetchAPIKeyModelsAt(ctx, cfg, origin)
+		if errFetch == nil {
+			if inferenceOriginMemory.remember(origin) {
+				hostLog("info", "agentrouter catalogue origin", map[string]any{"origin": origin})
+			}
+			return models, nil
+		}
+		lastErr = errFetch
+		if !isTransportFailure(errFetch) {
+			return nil, errFetch
+		}
+		inferenceOriginMemory.markFailed(origin)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("agentrouter models: no origin available")
+	}
+	return nil, lastErr
+}
+
+func fetchAPIKeyModelsAt(ctx context.Context, cfg pluginConfig, origin string) ([]pluginapi.ModelInfo, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	url := strings.TrimSuffix(cfg.BaseURL, "/") + "/v1/models"
+	url := strings.TrimSuffix(origin, "/") + "/v1/models"
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -416,7 +441,7 @@ func fetchAPIKeyModels(ctx context.Context, cfg pluginConfig) ([]pluginapi.Model
 	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", cfg.UserAgent)
-	client := controlPlaneClient(cfg)
+	client := originHTTPClient(cfg, origin, 20*time.Second)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
 		return nil, fmt.Errorf("fetch agentrouter models: %w", errDo)
@@ -462,33 +487,14 @@ func fetchAPIKeyModels(ctx context.Context, cfg pluginConfig) ([]pluginapi.Model
 }
 
 // fetchPricing reads the public pricing endpoint to learn which endpoint types
-// each model supports (and its availability groups).
+// each model supports (and its availability groups). /api/* is the WAF-sensitive
+// surface, so it goes through the console failover path.
 func fetchPricing(ctx context.Context, cfg pluginConfig) (*pricingResponse, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	url := controlEndpoint(cfg, "/api/pricing")
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", cfg.UserAgent)
-	client := controlPlaneClient(cfg)
-	resp, errDo := client.Do(req)
-	if errDo != nil {
-		return nil, errDo
-	}
-	defer resp.Body.Close()
-	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if errRead != nil {
-		return nil, errRead
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, newUpstreamError(resp.StatusCode, summarizeUpstreamError(body))
-	}
 	var parsed pricingResponse
-	if errUnmarshal := json.Unmarshal(body, &parsed); errUnmarshal != nil {
-		return nil, errUnmarshal
+	if errCall := consoleJSON(reqCtx, cfg, "/api/pricing", nil, &parsed); errCall != nil {
+		return nil, errCall
 	}
 	return &parsed, nil
 }
@@ -565,24 +571,6 @@ func primeCatalogue(cfg pluginConfig) {
 func fetchAnnouncements(ctx context.Context, cfg pluginConfig) ([]map[string]any, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	request, errRequest := http.NewRequestWithContext(reqCtx, http.MethodGet, controlEndpoint(cfg, "/api/status"), nil)
-	if errRequest != nil {
-		return nil, errRequest
-	}
-	request.Header.Set("Accept", "application/json")
-	request.Header.Set("User-Agent", cfg.UserAgent)
-	response, errDo := controlPlaneClient(cfg).Do(request)
-	if errDo != nil {
-		return nil, errDo
-	}
-	defer response.Body.Close()
-	body, errRead := io.ReadAll(io.LimitReader(response.Body, 8<<20))
-	if errRead != nil {
-		return nil, errRead
-	}
-	if response.StatusCode != http.StatusOK {
-		return nil, newUpstreamError(response.StatusCode, summarizeUpstreamError(body))
-	}
 	var payload struct {
 		Data struct {
 			Announcements []struct {
@@ -593,8 +581,8 @@ func fetchAnnouncements(ctx context.Context, cfg pluginConfig) ([]map[string]any
 			} `json:"announcements"`
 		} `json:"data"`
 	}
-	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
-		return nil, errUnmarshal
+	if errCall := consoleJSON(reqCtx, cfg, "/api/status", nil, &payload); errCall != nil {
+		return nil, errCall
 	}
 	out := make([]map[string]any, 0, len(payload.Data.Announcements))
 	for _, item := range payload.Data.Announcements {

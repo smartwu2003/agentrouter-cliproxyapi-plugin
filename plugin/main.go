@@ -87,7 +87,7 @@ import (
 
 const (
 	pluginName    = "agentrouter"
-	pluginVersion = "0.2.1"
+	pluginVersion = "0.2.3"
 	pluginAuthor  = "smartwu2003"
 	pluginRepo    = "https://github.com/smartwu2003/agentrouter-cliproxyapi-plugin"
 	providerKey   = "agentrouter"
@@ -244,10 +244,10 @@ func buildRegistration() registration {
 			Author:           pluginAuthor,
 			GitHubRepository: pluginRepo,
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "base_url", Type: pluginapi.ConfigFieldTypeString, Description: "AgentRouter API base URL. Use https://ps.air-outer.com (direct, China) or https://agentrouter.org (needs a proxy)."},
+				{Name: "base_url", Type: pluginapi.ConfigFieldTypeString, Description: "Inference origin. https://ps.air-outer.com is directly reachable from mainland China; https://agentrouter.org needs a proxy. On a transport failure the plugin retries the alternate origin and remembers the one that worked."},
 				{Name: "api_key", Type: pluginapi.ConfigFieldTypeString, Description: "AgentRouter API key (Bearer token). Read from the AgentRouter console."},
 				{Name: "user_agent", Type: pluginapi.ConfigFieldTypeString, Description: "Client User-Agent sent upstream. AgentRouter rejects unrecognised clients; keep a whitelisted client identity."},
-				{Name: "proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "Optional HTTP/SOCKS5 proxy used only for AgentRouter control-plane calls (catalogue refresh, account, check-in)."},
+				{Name: "proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "Optional HTTP proxy. It is applied only to origins that need one: agentrouter.org (console and inference). The mainland origin ps.air-outer.com always connects directly."},
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Explicit model list. Each entry is an object with name, alias, display_name, context_length, max_completion_tokens and protocols fields."},
 				{Name: "auto_discover_models", Type: pluginapi.ConfigFieldTypeBoolean, Default: true, Description: "Fetch the models the API key can use from AgentRouter at startup and on refresh."},
 				{Name: "model_protocols", Type: pluginapi.ConfigFieldTypeObject, Description: "Map of model name to protocol override (openai, responses or anthropic)."},
@@ -257,7 +257,7 @@ func buildRegistration() registration {
 				{Name: "user_id", Type: pluginapi.ConfigFieldTypeString, Description: "Optional numeric AgentRouter user ID sent as New-Api-User for dashboard calls."},
 				{Name: "api_key_name", Type: pluginapi.ConfigFieldTypeString, Default: "EasyCLIProxyAPI", Description: "Token name the plugin creates or reuses when provisioning an inference API key."},
 				{Name: "data_dir", Type: pluginapi.ConfigFieldTypeString, Description: "Directory for persisted dashboard state (default: plugins/ next to the core binary)."},
-				{Name: "dashboard_base_url", Type: pluginapi.ConfigFieldTypeString, Default: defaultDashboardURL, Description: "Console origin used for account/dashboard APIs (default https://ps.air-outer.com; the plugin retries https://agentrouter.org when the WAF blocks it)."},
+				{Name: "dashboard_base_url", Type: pluginapi.ConfigFieldTypeString, Default: defaultDashboardURL, Description: "Console origin used for account/dashboard APIs (default https://ps.air-outer.com). When one origin is WAF-blocked or unreachable the client answers from the alternate origin and remembers it for ten minutes."},
 				{Name: "checkin_on_startup", Type: pluginapi.ConfigFieldTypeBoolean, Default: false, Description: "Run the daily check-in once when the plugin loads."},
 				{Name: "checkin_hour", Type: pluginapi.ConfigFieldTypeInteger, Default: 9, Description: "Beijing-time hour (0-23) after which the automatic check-in may run."},
 			},
@@ -294,9 +294,19 @@ func configure(raw []byte) error {
 	// so a reconfigure does not silently drop an account authorization.
 	state := loadState(cfg)
 	cfg = applyState(cfg, state)
+	previous := loadedConfig()
 	activeConfigMu.Lock()
 	activeConfig = cfg
 	activeConfigMu.Unlock()
+	// A changed origin invalidates the sticky choice: the user just told us
+	// where to go, and the remembered origin belongs to the old setting.
+	if normalizeBaseURL(previous.BaseURL) != normalizeBaseURL(cfg.BaseURL) {
+		inferenceOriginMemory.reset()
+	}
+	if normalizeBaseURL(previous.DashboardBaseURL) != normalizeBaseURL(cfg.DashboardBaseURL) ||
+		strings.TrimSpace(previous.ProxyURL) != strings.TrimSpace(cfg.ProxyURL) {
+		consoleOriginMemory.reset()
+	}
 	onConfigLoaded(cfg)
 	return nil
 }

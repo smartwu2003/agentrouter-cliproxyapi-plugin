@@ -287,7 +287,7 @@ const dashboardCSS = `
 
   /* Pills */
   .pill {
-    display: inline-flex; align-items: center; gap: 5px;
+    display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
     margin: 0 4px 2px 0; padding: 1px 9px;
     font-size: 11px; font-weight: 550; line-height: 1.7;
     color: var(--muted); background: var(--bg-soft);
@@ -300,6 +300,43 @@ const dashboardCSS = `
   .pill.ok::before, .pill.warn::before, .pill.err::before {
     content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor;
   }
+  .pill.spend { border-color: transparent; color: var(--accent-text); background: var(--accent-soft); }
+  .pill.recharge { border-color: transparent; color: var(--ok); background: var(--ok-bg); }
+  .pill.spend::before, .pill.recharge::before {
+    content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor;
+  }
+
+  /* Usage log table: content-sized columns keep badges on one line; the freed
+     width goes to 详情 instead of leaving a gap before Tokens. */
+  table.logs-table { table-layout: auto; min-width: 0; }
+  table.logs-table th, table.logs-table td { padding: 10px 12px; }
+  table.logs-table tbody tr { transition: background var(--dur) var(--ease); }
+  table.logs-table tbody tr:hover { background: var(--bg-soft); }
+  table.logs-table .log-time {
+    width: 1%; min-width: 150px; white-space: nowrap;
+    color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+  table.logs-table .log-model { width: 1%; white-space: nowrap; font-weight: 550; }
+  table.logs-table .log-model > span {
+    display: block; max-width: 150px; overflow: hidden;
+    white-space: nowrap; text-overflow: ellipsis;
+  }
+  table.logs-table .log-type { width: 1%; white-space: nowrap; }
+  table.logs-table .log-type .pill { margin: 0; }
+  table.logs-table .log-num {
+    width: 1%; text-align: right; white-space: nowrap;
+    color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+  table.logs-table .log-cost {
+    width: 1%; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums;
+  }
+  table.logs-table .log-cost.zero { color: var(--muted); }
+  table.logs-table .log-detail { width: 100%; }
+  table.logs-table .log-detail > span {
+    display: block; max-width: 100%; overflow: hidden; white-space: nowrap;
+    text-overflow: ellipsis; color: var(--muted);
+  }
+  table.logs-table th.right { text-align: right; }
 
   /* Banners + empty states */
   .banner {

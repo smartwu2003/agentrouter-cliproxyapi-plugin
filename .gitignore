@@ -5,3 +5,4 @@ testrun/
 *.so
 *.h
 plugin/server.log
+.gotmp/
